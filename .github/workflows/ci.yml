@@ -1,0 +1,202 @@
+# CI: lint the Nix sources, run every flake check (QEMU VM tests, KVM-backed),
+# and build + publish the CI/demo installer ISO.
+#
+# The published ISO is .#installer-iso-ci: the offline installer baking the
+# anon closure with DUMMY VPN values (the real endpoint and peer key are
+# secrets and never in git). A system installed from it stays offline by
+# design — the killswitch holds until it is updated from an ISO built locally
+# with real values (`just iso`). Publishing it proves the whole system builds
+# and gives a bootable demo/inspection image.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # Tools come from the flake's own locked nixpkgs (--inputs-from), same
+      # pins as `just lint`. `nix flake check` is NOT usable here: evaluating
+      # nixosConfigurations.anon trips the VPN-placeholder assertion by design.
+      - name: statix (anti-patterns; see statix.toml for disabled lints)
+        run: nix run --inputs-from . --flake-registry "" nixpkgs#statix -- check .
+      - name: deadnix (dead code; -L allows idiomatic unused module args)
+        run: nix run --inputs-from . --flake-registry "" nixpkgs#deadnix -- --fail -L .
+      - name: Evaluate flake outputs (checks + CI ISO)
+        run: |
+          nix eval .#checks.x86_64-linux --apply builtins.attrNames
+          nix eval --raw .#packages.x86_64-linux.installer-iso-ci.drvPath
+
+  discover:
+    name: Discover checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # Auto-discover like `just test`: new checks need no workflow edits.
+      - id: list
+        run: echo "checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: "Test: ${{ matrix.check }}"
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJson(needs.discover.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@v4
+      # GitHub's standard Linux runners expose /dev/kvm, but not to the runner
+      # user; open it up so the NixOS test VMs get hardware acceleration.
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          # The VM-test derivations require the kvm system feature.
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Build check ${{ matrix.check }}
+        run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
+
+  iso:
+    name: Build installer ISO + SBOM + CVE audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      # The full anon closure (gateway + Plasma workstation microVM) plus the
+      # ISO squashfs need more scratch space than a stock runner has free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - uses: cachix/install-nix-action@v31
+      - name: Build .#installer-iso-ci
+        run: nix build -L .#installer-iso-ci
+      # Collect and upload the ISO before the CVE audit: a red audit must not
+      # cost us the build artifact (it is needed to debug/fix the audit).
+      - name: Collect ISO artifact
+        run: |
+          mkdir -p dist
+          cp -L result/iso/*.iso dist/
+          (cd dist && sha256sum *.iso > SHA256SUMS)
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anon-installer-ci-iso
+          path: dist/
+          retention-days: 14
+          compression-level: 0 # the ISO's squashfs is already compressed
+          if-no-files-found: error
+      # SBOM + CVE audit of the system closure the ISO bakes. The closure is
+      # already realized in the store (it is an input of the ISO), so this
+      # build is instant. Same tools and gate as `just sbom` / `just audit`.
+      - name: Build system closure for SBOM
+        run: nix build .#anon-ci-system -o result-system
+      - name: Generate SBOM (sbomnix, SPDX + CycloneDX)
+        run: |
+          mkdir -p sbom
+          nix run --inputs-from . --flake-registry "" nixpkgs#sbomnix -- "$(readlink -f result-system)" \
+            --cdx sbom/sbom.cdx.json --spdx sbom/sbom.spdx.json --csv sbom/sbom.csv
+      # Fails on any Critical finding (.grype.yaml holds the triaged ignores).
+      # The severity summary is written even when the gate trips.
+      - name: CVE audit (grype scan of the SBOM, fails on Critical)
+        run: |
+          rc=0
+          nix run --inputs-from . --flake-registry "" nixpkgs#grype -- sbom:./sbom/sbom.cdx.json \
+            --output json --file sbom/vulns.json --fail-on critical || rc=$?
+          {
+            echo "## CVE audit (grype, fail-on: critical)"
+            echo ""
+            nix run --inputs-from . --flake-registry "" nixpkgs#jq -- -r \
+              '.matches | group_by(.vulnerability.severity)
+               | map("- **\(.[0].vulnerability.severity)**: \(length)") | .[]' \
+              sbom/vulns.json
+            echo ""
+            echo "Details: \`vulns.json\` in the \`sbom-cve-audit\` artifact."
+            echo "Triage: bump the nixpkgs pin, or add a documented ignore to \`.grype.yaml\`."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: sbom-cve-audit
+          path: sbom/
+          retention-days: 90
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, iso]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: anon-installer-ci-iso
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-cve-audit
+          path: dist
+      # Release assets are capped at 2 GiB per file; split the ISO if needed.
+      - name: Split oversized ISO
+        run: |
+          cd dist
+          for iso in *.iso; do
+            if [ "$(stat -c%s "$iso")" -ge 2000000000 ]; then
+              split -b 1900M -d "$iso" "$iso.part"
+              rm "$iso"
+              echo "Reassemble with: cat $iso.part* > $iso  (then check SHA256SUMS)" > REASSEMBLE.txt
+            fi
+          done
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **anon-installer-ci.iso** is the CI/demo build of the offline
+            installer: it bakes the full anon system with *dummy* VPN values,
+            so a machine installed from it stays offline by design (the
+            killswitch holds without a working tunnel). Use it to inspect or
+            demo the system. For a real install, build `.#installer-iso`
+            locally with your VPN values filled in (see README), or install
+            from this ISO and then apply your own build with `update-anon`.
+
+            Verify downloads against `SHA256SUMS`. If the ISO was split to fit
+            the 2 GiB asset limit, see `REASSEMBLE.txt`.
+
+            `sbom.spdx.json` / `sbom.cdx.json` are SBOMs of the full system
+            closure (sbomnix), and `vulns.json` is the grype CVE scan of that
+            SBOM (the release only exists if it had no untriaged Criticals;
+            expect some false positives from CPE matching).

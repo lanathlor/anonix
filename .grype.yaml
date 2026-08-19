@@ -1,0 +1,151 @@
+# grype config, auto-loaded from the repo root by `just audit` and CI.
+#
+# The CVE audit fails on any Critical finding (--fail-on critical). When it
+# goes red, triage each finding and either update the nixpkgs pin (real fix)
+# or add an ignore entry HERE with a comment saying why it is acceptable —
+# never silence the gate itself. Beware: grype matches CPEs against Nix
+# attribute names, so some findings are false positives for a different
+# upstream project version; those belong here too, documented.
+#
+# Entry syntax (all selectors optional, AND-ed together):
+#   - vulnerability: CVE-2026-12345   # why ignored, date, who decided
+#     package:
+#       name: somepkg
+#       version: 1.2.3
+ignore:
+  # False positive: fixed in spice 0.13.2 (2016); we ship 0.16.0. Grype's CPE
+  # range is unbounded. Same mismatch OpenEmbedded explicitly ignores.
+  # https://www.cvedetails.com/cve/CVE-2016-0749/  (triaged 2026-08-17)
+  - vulnerability: CVE-2016-0749
+    package:
+      name: spice
+
+  # False positive: fixed in LAPACK 3.10.1; nixpkgs' `lapack` wrapper reports
+  # version "3" while the wrapped lapack-reference is 3.12.1 (verified by
+  # eval). Grype matches the truncated wrapper version.
+  # https://www.netlib.org/lapack/lapack-3.10.1.html  (triaged 2026-08-17)
+  - vulnerability: CVE-2021-4048
+    package:
+      name: lapack
+
+  # False positive: fixed at plutosvg commit 336c029 (Dec 2023), which
+  # predates plutosvg's first tagged release; 0.0.8 (2025) is not affected.
+  # The NVD range is commit-based and unmapped to versions.
+  # https://nvd.nist.gov/vuln/detail/CVE-2023-44709  (triaged 2026-08-17)
+  - vulnerability: CVE-2023-44709
+    package:
+      name: plutosvg
+
+  # False positive: per the Debian security tracker this DTLS reassembly
+  # out-of-bounds read is fixed in gnutls 3.8.13 — exactly the version we
+  # ship. https://security-tracker.debian.org/tracker/CVE-2026-33845
+  # (triaged 2026-08-17)
+  - vulnerability: CVE-2026-33845
+    package:
+      name: gnutls
+
+  # False positive: already fixed in place. The pinned nixpkgs libssh2
+  # derivation backports the upstream fix as a patch (grep CVE-2026-7598 in
+  # its patch list), but the package version stays 1.11.1, so grype's
+  # version-only match flags it anyway. Reachable path (curl/nmap to hostile
+  # SSH servers over Tor) is therefore already closed.
+  # https://www.suse.com/security/cve/CVE-2026-7598.html  (triaged 2026-08-17)
+  - vulnerability: CVE-2026-7598
+    package:
+      name: libssh2
+
+  # False positives: both CVEs were filed against pre-release LibRaw commits
+  # and FIXED IN the 0.22.1 release — exactly the version we ship ("LibRaw
+  # 0.22.1 Release with security fixes", oss-sec). The DB range is unmapped.
+  # https://seclists.org/oss-sec/2026/q2/102
+  # https://security-tracker.debian.org/tracker/CVE-2026-20884
+  # (triaged 2026-08-17)
+  - vulnerability: CVE-2026-20884
+    package:
+      name: libraw
+  - vulnerability: CVE-2026-24450
+    package:
+      name: libraw
+
+  # Not applicable in this configuration: RSA-PSK *server* username-matching
+  # auth bypass. Nothing in this system runs a GnuTLS server, let alone with
+  # RSA-PSK, and the whole machine accepts no inbound connections (enforced
+  # by tests/security.nix + tests/invariants.nix). Re-evaluate if a GnuTLS
+  # server is ever added. https://ubuntu.com/security/CVE-2026-42010
+  # (triaged 2026-08-17)
+  - vulnerability: CVE-2026-42010
+    package:
+      name: gnutls
+
+  # ---- Not a real threat in this configuration -------------------------------
+  # Everything below is a genuine (unfixed-in-channel) CVE that does NOT reach
+  # a real attack surface here, for the reason stated. Unlike the false
+  # positives above, these should be RE-CHECKED whenever the design changes.
+
+  # Not applicable to this build: heap overflow only on 32-bit perl (byte vs.
+  # char length overflow of SSize_t when compiling a quantified fixed
+  # substring). This is an x86_64 system, so the overflowing path can't be
+  # reached. https://www.openwall.com/lists/oss-security/2026/05/26/1
+  # (triaged 2026-08-17)
+  - vulnerability: CVE-2026-8376
+    package:
+      name: perl
+
+  # Not reachable here: both are perl regex/zlib flaws that require perl to
+  # process ATTACKER-CONTROLLED input — a pathological regex compiled into a
+  # trie (13221), or attacker zlib data via Compress::Raw::Zlib (4176). On
+  # this box perl exists only as a build/packaging dependency; no service
+  # feeds it untrusted network input. Both are fixed upstream (5.43.10 /
+  # 5.42.2) but not yet in the pinned channel — drop these two on the next
+  # nixpkgs bump rather than keeping them long-term.
+  # https://security-tracker.debian.org/tracker/CVE-2026-13221
+  # https://nvd.nist.gov/vuln/detail/CVE-2026-4176  (triaged 2026-08-17)
+  - vulnerability: CVE-2026-13221
+    package:
+      name: perl
+  - vulnerability: CVE-2026-4176
+    package:
+      name: perl
+
+  # Dormant dependency: gpsd is pulled in only as a KDE plasma5support library
+  # link inside the workstation microVM. No GPS device exists in the VM and no
+  # gpsd daemon is started, so the vulnerable code never runs. Re-check if GPS
+  # hardware or the gpsd service is ever enabled.
+  # https://security-tracker.debian.org (CVE-2026-58459)  (triaged 2026-08-17)
+  - vulnerability: CVE-2026-58459
+    package:
+      name: gpsd
+
+  # ---- Contained in the isolated workstation microVM -------------------------
+  # These are local media/binary PARSER bugs (decode a crafted file) with no
+  # network- or gateway-facing path. They live only inside the workstation
+  # microVM, which is the design's blast-radius container: a compromise there
+  # still can't egress except through the Tor+VPN killswitch, and the gateway
+  # is unaffected (verified by tests/killswitch-*, tests/invariants). Opening
+  # hostile files is the workstation's whole job; isolation is the mitigation.
+  # No fixed version is in the pinned channel for any of these yet.
+
+  # libmad double-free in mad_decoder_run() on a crafted MP3, via KDE's
+  # phonon-vlc -> libvlc. Upstream is dead (2004); nixpkgs carries the 2017-CVE
+  # patch set but not this one. https://bugzilla.redhat.com/show_bug.cgi?id=CVE-2018-7263
+  - vulnerability: CVE-2018-7263
+    package:
+      name: libmad
+
+  # capstone disassembler heap issue on a crafted binary, via the microVM's
+  # reversing tools (radare2 etc). Analyst-opens-malware is the intended use.
+  - vulnerability: CVE-2025-68114
+    package:
+      name: capstone
+
+  # ffmpeg decode flaw on crafted media; the vulnerable 7.1.5 copy is pinned by
+  # the microVM's QEMU. Fixed in ffmpeg 8.1, not yet in channel.
+  - vulnerability: CVE-2026-40962
+    package:
+      name: ffmpeg
+
+  # gst-plugins-good decode flaw on crafted media, via the microVM's KDE stack.
+  # Fixed in 1.28.2, not yet in channel.
+  - vulnerability: CVE-2026-46470
+    package:
+      name: gst-plugins-good

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Format staged Markdown with prettier, then re-stage it.
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+# Staged (added/copied/modified/renamed) Markdown files, NUL-separated for
+# safety with odd filenames.
+mapfile -d '' -t files < <(
+  git diff --cached --name-only --diff-filter=ACMR -z -- '*.md' '*.markdown'
+)
+[ ${#files[@]} -eq 0 ] && exit 0
+
+if command -v prettier >/dev/null 2>&1; then
+  prettier --write --log-level warn -- "${files[@]}"
+elif command -v nix >/dev/null 2>&1; then
+  nix run nixpkgs#nodePackages.prettier -- --write --log-level warn -- "${files[@]}"
+else
+  echo "pre-commit: prettier not found (and no nix); skipping Markdown format" >&2
+  exit 0
+fi
+
+git add -- "${files[@]}"

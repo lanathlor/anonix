@@ -1,0 +1,9 @@
+# statix lint config (used by `just lint` and CI).
+# Lints deliberately disabled — they conflict with house style:
+#  - repeated_keys (W20): flat `a.b.c = ...;` keys are intentional here; they
+#    keep each setting greppable and next to its explanatory comment.
+#  - manual_inherit_from (W04): `x = cfg.x;` reads clearer than
+#    `inherit (cfg) x;` in option plumbing.
+#  - empty_pattern (W10): NixOS modules conventionally take `{ ... }:` even
+#    when no arguments are used (the signature documents the convention).
+disabled = ["repeated_keys", "manual_inherit_from", "empty_pattern"]
