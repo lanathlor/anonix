@@ -88,14 +88,25 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-      # The full anon closure (gateway + Plasma workstation microVM) plus the
-      # ISO squashfs need more scratch space than a stock runner has free.
+      # The ISO build's Nix store sits on / and the final xorriso write needs
+      # the full ~6 GiB ISO free on that filesystem. A stock runner is left
+      # only ~1-2 GiB short, so reclaim the preinstalled toolchains this job
+      # never uses — /opt/hostedtoolcache alone is ~8 GiB — to give / headroom.
+      # (Do NOT bind-mount /nix onto /mnt to "get a bigger disk": /mnt is not a
+      # separate volume on this runner image, so the mount is a no-op and the
+      # store stays on / regardless. Freeing / in place is what actually works.)
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          echo "Before:"; df -h /
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /usr/lib/jvm
           sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h /
+          echo "After:"; df -h /
       - uses: cachix/install-nix-action@v31
       - name: Build .#installer-iso-ci
         run: nix build -L .#installer-iso-ci
