@@ -12,7 +12,6 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -20,7 +19,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # Never cancel main runs: they auto-tag + publish a release and must finish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   lint:
@@ -162,10 +162,34 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  # Derive the next semver from conventional commits since the last vX.Y.Z tag
+  # (feat -> minor, fix/perf -> patch, <type>!/BREAKING CHANGE -> major). Emits
+  # an empty release_type when nothing since the last tag is releasable, in
+  # which case the release job below is skipped. First release is v0.1.0.
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      new_tag: ${{ steps.compute.outputs.new_tag }}
+      release_type: ${{ steps.compute.outputs.release_type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: compute next version
+        id: compute
+        run: bash .github/scripts/next-version.sh | tee -a "$GITHUB_OUTPUT"
+
+  # Auto-tag + publish on every push to main that carries a releasable commit.
+  # softprops creates the tag itself (tag_name + target_commitish), so no manual
+  # tagging is needed. Tags created by GITHUB_TOKEN don't retrigger CI, so this
+  # doesn't loop.
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test, iso]
+    if: github.ref == 'refs/heads/main' && needs.version.outputs.release_type != ''
+    needs: [lint, test, iso, version]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -193,6 +217,10 @@ jobs:
           ls -lh
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.new_tag }}
+          name: ${{ needs.version.outputs.new_tag }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
           files: dist/*
           generate_release_notes: true
           body: |
