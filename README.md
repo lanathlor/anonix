@@ -1,5 +1,11 @@
 # anonix
 
+> **Disclaimer:** anonix is an experiment. It is young, it has had no
+> independent security review, and a failure could silently deanonymize you.
+> Nobody whose safety, freedom, or livelihood depends on staying anonymous
+> should use it. If a system failure would have real-world consequences for
+> you, use Whonix, Tails, or Qubes instead.
+
 A NixOS flake for maximal anonymity. Every application is forced through Tor,
 Tor rides a WireGuard VPN tunnel, and the firewall drops everything else. If
 either layer is down, no packet leaves the machine.
