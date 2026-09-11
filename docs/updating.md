@@ -16,10 +16,11 @@ guards, workstation `/home`, `lan-bypass`) intact.
 ## Method A: re-flash a newer installer USB (the default path)
 
 Rebuild the ISO on your trusted builder with bumped inputs, write it to USB,
-boot the target, and run `update-anon`. It detects the existing install, asks
-for your LUKS passphrase, installs the USB's baked closure over the existing
-`/nix`, points the system profile at it, and re-signs the bootloader. Nothing
-is formatted.
+boot the target, and run `update-anon`. It finds the existing install by
+scanning every disk for the `persistcrypt` LUKS label, so it works whatever the
+drive is called; asks for your LUKS passphrase, installs the USB's baked
+closure over the existing `/nix`, points the system profile at it, and re-signs
+the bootloader. Nothing is formatted.
 
 ```sh
 # on the trusted builder, after `nix flake update`:
@@ -28,6 +29,7 @@ doas dd if=result/iso/anon-installer.iso of=/dev/sdX bs=4M status=progress oflag
 # boot the target on that USB (root autologin), then:
 update-anon              # keep the current /persist/lan-bypass list
 update-anon 10.0.0.2     # ... or replace it while updating
+update-anon --disk /dev/sda   # ... or restrict the search to one disk
 ```
 
 Roll back by choosing an older generation in the boot menu. (`install-anon`

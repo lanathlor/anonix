@@ -229,7 +229,7 @@ runtime, not baked into the build.
 
 ```sh
 # from the live ISO:
-install-anon age-identity 10.0.0.2       # 10.0.0.2 = your local LLM
+install-anon --disk /dev/sda age-identity 10.0.0.2   # 10.0.0.2 = your local LLM
 
 # or later, on the running box (no rebuild):
 echo 10.0.0.2 | doas tee /persist/lan-bypass

@@ -64,41 +64,94 @@
         }];
       };
 
-      # Offline installer ISO for a given evaluated anon system (the real one,
-      # or anonCi above). Bakes the exact system closure and the disko format
-      # script into the ISO so the install runs with no network and no flake
-      # evaluation on the target. Writes secrets onto the encrypted /persist.
-      # Target disk is whatever modules/disk.nix points at.
-      mkInstaller = { anon, isoBaseName }:
+      # Stand-in device the disko script is built against; install-anon rewrites
+      # it to the real target. Distinctive because the rewrite is a blind
+      # global replace. Shared with tests/disk.nix.
+      targetSentinel = "/dev/disk/by-id/ANONIX-INSTALL-TARGET";
+
+      # install-anon and update-anon, built for a given evaluated system. Kept
+      # out of mkInstaller so tests can build them against a throwaway system
+      # instead of the full anon closure.
+      mkInstallScripts = { anon }:
         let
-          # Install target disk from modules/disk.nix; scripts use it to detect
-          # an existing install and find the LUKS volumes.
-          targetDevice = anon.config.disko.devices.disk.main.device;
+          # Target used when --disk is omitted.
+          defaultDevice = anon.config.disko.devices.disk.main.device;
+
+          # disko inlines the device path as a literal with no runtime hook, and
+          # re-evaluating on the target would defeat the point of an offline
+          # ISO. So build against the sentinel and substitute at install time.
+          # Only partitioning depends on the device: the closure mounts by
+          # label, so toplevel is identical across targets (tests/disk.nix).
+          diskoScriptTemplate =
+            (anon.extendModules {
+              modules = [{
+                disko.devices.disk.main.device = nixpkgs.lib.mkForce targetSentinel;
+              }];
+            }).config.system.build.diskoScript;
+
+          # Optional `--disk <dev>`. Overwrites $disk, which the caller presets
+          # to its own default, and leaves the remaining args in "$@".
+          parseDiskFlag = ''
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --disk) shift
+                  [ "$#" -gt 0 ] || { echo "--disk needs a device argument" >&2; exit 1; }
+                  disk="$1"; shift ;;
+                --disk=*) disk="''${1#--disk=}"; shift ;;
+                --) shift; break ;;
+                *) break ;;
+              esac
+            done
+          '';
+
+          # A GPT written to a partition or a stale path yields an unbootable
+          # machine, and by then the disk is already wiped.
+          requireWholeDisk = ''
+            require_whole_disk() {
+              local d="$1"
+              [ -b "$d" ] || { echo "not a block device: $d" >&2; exit 1; }
+              case "$(lsblk -dno TYPE "$d" 2>/dev/null)" in
+                disk) ;;
+                part) echo "$d is a partition; pass the whole disk (e.g. /dev/sda, not /dev/sda1)." >&2; exit 1 ;;
+                *)    echo "$d is not a whole disk; pass something like /dev/nvme0n1 or /dev/sda." >&2; exit 1 ;;
+              esac
+            }
+          '';
 
           installAnon = pkgs.writeShellApplication {
             name = "install-anon";
-            runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools mkpasswd ];
+            runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools mkpasswd gnused gnugrep ];
             text = ''
+              ${requireWholeDisk}
+              disk="${defaultDevice}"
+              ${parseDiskFlag}
               if [ "$#" -lt 1 ]; then
                 cat >&2 <<'EOF'
-              usage: install-anon <age-identity-file> [lan-bypass-ip ...]
+              usage: install-anon [--disk <device>] <age-identity-file> [lan-bypass-ip ...]
 
-                Wipes the disk configured in modules/disk.nix and installs the anon
-                system offline from this USB, then writes the age identity onto the
-                encrypted /persist so it boots working. You are prompted to set
-                the gateway and workstation login passwords; no pre-made hash file.
-                Put the age identity on the USB (or another drive) beforehand.
+                Wipes the target disk and installs the anon system offline from this
+                USB, then writes the age identity onto the encrypted /persist so it
+                boots working. You are prompted to set the gateway and workstation
+                login passwords; no pre-made hash file. Put the age identity on the
+                USB (or another drive) beforehand.
+
+                --disk picks the target disk; run lsblk first. It must be a whole
+                disk, not a partition. Defaults to the disk this ISO was built for:
+              EOF
+                echo "    ${defaultDevice}" >&2
+                cat >&2 <<'EOF'
 
                 Any extra args are LAN-bypass IPs (hosts the workstation may reach
                 directly, bypassing Tor, e.g. a local LLM). They are written to
                 /persist/lan-bypass; leave none for a fully-torified box. You can
                 also edit that file later on the running system (no rebuild). E.g.:
-                  install-anon age-identity 10.0.0.2
+                  install-anon --disk /dev/sda age-identity 10.0.0.2
               EOF
                 exit 1
               fi
               identity="$1"; shift 1
               test -f "$identity" || { echo "no age identity file: $identity" >&2; exit 1; }
+              require_whole_disk "$disk"
 
               # Prompt (twice, confirmed) for a login password and print its sha-512
               # hash on stdout. Prompts go to stderr so $(...) captures only the hash.
@@ -118,19 +171,17 @@
 
               # Warn if the target already holds an anon install: this command wipes
               # it. update-anon keeps /persist instead.
-              if [ -b "${targetDevice}" ]; then
-                while IFS= read -r part; do
-                  if [ "$(cryptsetup luksDumpLabel "$part" 2>/dev/null || true)" = persistcrypt ]; then
-                    echo "WARNING: $part looks like an existing anon /persist (encrypted)." >&2
-                    echo "install-anon will destroy it: secrets, Secure Boot keys and the" >&2
-                    echo "workstation /home included. To keep /persist and just apply this" >&2
-                    echo "USB's system, abort now and run:  update-anon" >&2
-                    break
-                  fi
-                done < <(lsblk -rno PATH "${targetDevice}" 2>/dev/null)
-              fi
+              while IFS= read -r part; do
+                if [ "$(cryptsetup luksDumpLabel "$part" 2>/dev/null || true)" = persistcrypt ]; then
+                  echo "WARNING: $part looks like an existing anon /persist (encrypted)." >&2
+                  echo "install-anon will destroy it: secrets, Secure Boot keys and the" >&2
+                  echo "workstation /home included. To keep /persist and just apply this" >&2
+                  echo "USB's system, abort now and run:  update-anon" >&2
+                  break
+                fi
+              done < <(lsblk -rno PATH "$disk" 2>/dev/null)
 
-              echo "This erases the target disk (see modules/disk.nix) and installs anon."
+              echo "This ERASES $disk ($(lsblk -dno SIZE,MODEL "$disk" 2>/dev/null || true)) and installs anon."
               printf 'Type ERASE to continue: '; read -r ans
               [ "$ans" = ERASE ] || { echo "aborted."; exit 1; }
 
@@ -140,7 +191,19 @@
               ws_hash=$(prompt_pw "the workstation login (user 'user')")
 
               # 1. Wipe, partition, LUKS (prompts for passphrase), format, mount at /mnt.
-              ${anon.config.system.build.diskoScript}
+              #    Point the baked script at the disk chosen above. The rewrite
+              #    goes to a tmpfs copy, never the ISO's read-only store.
+              disko_run=$(mktemp -d)
+              trap 'rm -rf "$disko_run"' EXIT
+              sed "s|${targetSentinel}|$disk|g" ${diskoScriptTemplate} > "$disko_run/disko"
+              chmod +x "$disko_run/disko"
+              # A surviving sentinel means the rewrite missed; partitioning it
+              # would wipe the wrong thing.
+              if grep -q '${targetSentinel}' "$disko_run/disko"; then
+                echo "internal error: target disk substitution failed; refusing to partition." >&2
+                exit 1
+              fi
+              "$disko_run/disko"
               ${nixpkgs.lib.optionalString anon.config.anon.duress.enable ''
               # 1b. Enrol the duress passphrase into LUKS keyslot ${toString anon.config.anon.duress.keySlot}
               #     on both volumes. Typing it at boot crypto-erases /persist and boots
@@ -196,22 +259,37 @@
             name = "update-anon";
             runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools ];
             text = ''
-              # usage: update-anon [lan-bypass-ip ...]
-              #   With no args the existing /persist/lan-bypass is left unchanged;
-              #   any args REPLACE it (same meaning as for install-anon).
-              device=${targetDevice}
+              # usage: update-anon [--disk <device>] [lan-bypass-ip ...]
+              #   With no lan-bypass args the existing /persist/lan-bypass is left
+              #   unchanged; any args REPLACE it (same meaning as for install-anon).
+              #   --disk restricts the search to one disk; by default every disk
+              #   is scanned, which is safe because nothing here is wiped.
+              ${requireWholeDisk}
+              disk=""
+              ${parseDiskFlag}
+              if [ -n "$disk" ]; then
+                require_whole_disk "$disk"
+                search=$disk
+                where="$disk"
+              else
+                search=$(lsblk -dno PATH 2>/dev/null || true)
+                where="any disk"
+              fi
 
               # Detect an existing anon install by its LUKS2 /persist header label.
               found=""
-              if [ -b "$device" ]; then
+              device=""
+              while IFS= read -r d; do
+                [ -n "$d" ] || continue
                 while IFS= read -r part; do
                   if [ "$(cryptsetup luksDumpLabel "$part" 2>/dev/null || true)" = persistcrypt ]; then
-                    found="$part"; break
+                    found="$part"; device="$d"; break
                   fi
-                done < <(lsblk -rno PATH "$device" 2>/dev/null)
-              fi
+                done < <(lsblk -rno PATH "$d" 2>/dev/null || true)
+                if [ -n "$found" ]; then break; fi
+              done <<< "$search"
               if [ -z "$found" ]; then
-                echo "No existing anon install (a 'persistcrypt' LUKS volume) found on $device." >&2
+                echo "No existing anon install (a 'persistcrypt' LUKS volume) found on $where." >&2
                 echo "Nothing to update. For a fresh install use: install-anon <age-identity>" >&2
                 exit 1
               fi
@@ -251,13 +329,25 @@
             '';
           };
         in
+        { inherit installAnon updateAnon defaultDevice; };
+
+      # Offline installer ISO for a given evaluated anon system (the real one,
+      # or anonCi above). Bakes the exact system closure and the disko format
+      # script into the ISO so the install runs with no network and no flake
+      # evaluation on the target. Writes secrets onto the encrypted /persist.
+      # The target disk is picked at install time with --disk.
+      mkInstaller = { anon, isoBaseName }:
+        let
+          inherit (mkInstallScripts { inherit anon; })
+            installAnon updateAnon defaultDevice;
+        in
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
             ({ modulesPath, lib, pkgs, ... }: {
               imports = [ (modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix") ];
               environment.systemPackages = [ installAnon updateAnon pkgs.mkpasswd pkgs.age pkgs-unstable.vim ];
-              systemd.tmpfiles.rules = [ "C /root/README.md 0644 root root - ${installReadme}" ];
+              systemd.tmpfiles.rules = [ "C /root/README.md 0644 root root - ${mkInstallReadme defaultDevice}" ];
               services.getty.helpLine = lib.mkForce ''
 
                 >>> Offline installer. Run:  cat README.md
@@ -277,16 +367,20 @@
         };
 
       # Cheat sheet placed at /root/README.md on the live ISO.
-      installReadme = pkgs.writeText "README.md" ''
+      # Takes the ISO's default install target so the text can name it.
+      mkInstallReadme = defaultDevice: pkgs.writeText "README.md" ''
         ================================================================
          anonix OFFLINE INSTALLER  (anon: Tor-over-VPN + isolated WS)
         ================================================================
         This USB installs the whole system onto this machine. Everything is baked
-        in; no network is used. It wipes the disk configured at build time.
+        in; no network is used. It wipes the disk you point it at.
 
-        ---- 1. Check the target disk --------------------------------------------
+        ---- 1. Pick the target disk ---------------------------------------------
           lsblk
-        The installer erases the disk set in modules/disk.nix. Be sure it's right.
+        Pass the disk to install-anon with --disk, e.g. --disk /dev/sda. It must
+        be a whole disk (/dev/sda), not a partition (/dev/sda1). With no --disk
+        the default is the disk this ISO was built for: ${defaultDevice}
+        The installer erases that disk completely. Be sure it's right.
 
         ---- 2. Get your two secrets onto this box -------------------------------
         (a) age identity: the private key matching the public key you built this
@@ -302,11 +396,14 @@
             them for you and writes them onto the encrypted /persist).
 
         ---- 3. Install ----------------------------------------------------------
-          install-anon /root/age-identity
+          install-anon --disk /dev/sda /root/age-identity
+        Use the disk you picked in step 1. Omit --disk to use this ISO's default
+        (${defaultDevice}).
         Reach a LAN host directly (bypassing Tor), e.g. a local LLM: add its IP:
-          install-anon /root/age-identity 10.0.0.2
-        You type ERASE to confirm, set the gateway and workstation login
-        passwords when prompted, then choose a LUKS passphrase (remember it).
+          install-anon --disk /dev/sda /root/age-identity 10.0.0.2
+        You type ERASE to confirm (the prompt names the disk and its size), set
+        the gateway and workstation login passwords when prompted, then choose a
+        LUKS passphrase (remember it).
 
         ---- 4. Reboot -----------------------------------------------------------
           - Remove the USB and power on. Enter the LUKS passphrase at boot.
@@ -335,6 +432,9 @@
         and the workstation /home are preserved:
           update-anon                 # detect the install, keep the LAN-bypass list
           update-anon 10.0.0.2        # ... and replace the LAN-bypass list
+          update-anon --disk /dev/sda # ... only look at this disk
+        With no --disk it scans every disk for the install, so it finds it
+        whatever the drive is called. Nothing is wiped either way.
         It asks for the existing LUKS passphrase, installs offline, and never
         formats. Roll back via an older generation in the boot menu.
 
@@ -407,6 +507,9 @@
           import ./tests/security.nix { inherit system nixpkgs; };
         anon-security-invariants =
           import ./tests/invariants.nix { inherit system nixpkgs; config = anon.config; };
+        # Guards the --disk rewrite in mkInstaller (eval-only, no KVM).
+        disk-target-is-runtime-selectable =
+          import ./tests/disk.nix { inherit system nixpkgs anon targetSentinel; };
         no-clearnet-leak =
           import ./tests/no-leak.nix { inherit system nixpkgs; };
         # Regression guards for the workstation return-traffic drop: eval-level

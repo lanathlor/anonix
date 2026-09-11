@@ -20,8 +20,6 @@
   disko.devices = {
     disk.main = {
       type = "disk";
-      # Target disk. Set to the host's disk before building the ISO (`lsblk`);
-      # the offline installer wipes exactly this device.
       device = lib.mkDefault "/dev/nvme0n1";
       content = {
         type = "gpt";

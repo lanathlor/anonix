@@ -26,9 +26,13 @@ The disk layout is declarative (`modules/disk.nix`, via [disko]). There is no
 only generic initrd storage drivers (SATA/NVMe/USB/virtio), so the same image
 boots on essentially any x86_64 box. Fill in these before building:
 
-1. **Target disk.** Set `disko.devices.disk.main.device` in `modules/disk.nix`
-   (check with `lsblk`, e.g. `/dev/nvme0n1`). This is the disk the installer
-   wipes.
+1. **Target disk.** Nothing to fill in: the installer takes `--disk` at install
+   time, so one ISO installs to whatever drive the machine has.
+   `disko.devices.disk.main.device` in `modules/disk.nix` is only the default
+   used when `--disk` is omitted; set it if you always install to the same
+   drive. Nothing else depends on it — every mount resolves through the
+   partition and LUKS labels, which the `disk-target-is-runtime-selectable`
+   check enforces.
 2. **VPN.** Any WireGuard provider works (Mullvad, IVPN, ProtonVPN, AzireVPN,
    or one you host). Generate a WireGuard config and fill the non-secret
    values in `modules/vpn.nix`: `endpointIp`, `endpointPort`,
@@ -48,9 +52,9 @@ already-running NixOS, `just check && doas nixos-rebuild switch --flake .#anon`.
 
 `just iso` (or `nix build .#installer-iso`) builds a self-contained installer
 ISO with the entire built `anon` system and the disko format script baked in.
-It wipes the disk and installs fully offline: no network, no evaluation on the
-target. Because the closure is baked in, steps 1 and 2 above must be done
-first.
+It wipes the disk you point it at and installs fully offline: no network, no
+evaluation on the target. Because the closure is baked in, steps 2 and 3 above
+must be done first.
 
 ```sh
 just iso                                   # -> result/iso/anon-installer.iso
@@ -61,13 +65,17 @@ Boot the USB on the target (root autologin), put your `age-identity` somewhere
 reachable (another USB, `/root`, ...), then:
 
 ```sh
-install-anon /path/to/age-identity
-# type ERASE to confirm. It prompts for the gateway ('anon') and workstation
-# ('user') login passwords and the LUKS passphrase, wipes the disk, installs
-# offline, and writes the secrets onto the encrypted /persist. Then reboot.
+lsblk                                      # find the target drive
+install-anon --disk /dev/sda /path/to/age-identity
+# --disk must be a whole disk (/dev/sda), not a partition (/dev/sda1); the
+# installer refuses a partition. Omit it to use the modules/disk.nix default.
+# type ERASE to confirm (the prompt names the disk and its size). It prompts
+# for the gateway ('anon') and workstation ('user') login passwords and the
+# LUKS passphrase, wipes the disk, installs offline, and writes the secrets
+# onto the encrypted /persist. Then reboot.
 ```
 
-The installer touches nothing but the configured disk and bakes no secrets
+The installer touches nothing but the disk you named and bakes no secrets
 into the ISO, so the ISO is safe to keep and reuse. On first boot you enter
 the LUKS passphrase, then do the one-time [Secure Boot
 enrollment](secure-boot.md).

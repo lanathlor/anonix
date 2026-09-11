@@ -211,17 +211,19 @@ Quit QEMU with `Ctrl-a x`.
 Three inputs, then one command; see [docs/install.md](docs/install.md) for
 the details:
 
-1. Set the target disk in `modules/disk.nix`.
-2. Fill your VPN's WireGuard values in `modules/vpn.nix` and encrypt the
+1. Fill your VPN's WireGuard values in `modules/vpn.nix` and encrypt the
    private key with agenix (see [VPN setup](#vpn-setup-required); Mullvad is
    the running example, any WireGuard provider works).
-3. Create the machine's age identity and register its public key in
+2. Create the machine's age identity and register its public key in
    `secrets/secrets.nix`.
 
 Then `just iso`, write the ISO to a USB stick, boot the target, and run
-`install-anon <age-identity>`. The install is fully offline. Updates work the
-same way (re-flash and run `update-anon`); see
-[docs/updating.md](docs/updating.md).
+`install-anon --disk /dev/sda <age-identity>` (run `lsblk` first; it must be a
+whole disk, not a partition). The target disk is chosen at install time, so one
+ISO works on machines with different drives; `modules/disk.nix` only sets the
+default used when `--disk` is omitted. The install is fully offline. Updates
+work the same way (re-flash and run `update-anon`, which scans every disk for
+the existing install); see [docs/updating.md](docs/updating.md).
 
 ## What is verified, what is untested
 
@@ -239,6 +241,7 @@ Verified:
 | Gateway return traffic to the workstation is permitted (regression)                               | VM test `workstation-return` + eval check `workstation-return-ruleset` |
 | Duress passphrase crypto-erases `/persist`, decoy boots and logs in, no forensic trace            | VM test `duress-wipes-persist`                                         |
 | `update-anon` mechanism keeps `/persist` and retains the old generation                           | VM test `update-keeps-persist`                                         |
+| One ISO installs to any disk: the closure is device-independent and the `--disk` rewrite is total  | eval check `disk-target-is-runtime-selectable`                         |
 | Locked root, immutable users, and other option-level invariants can't drift                       | eval check `anon-security-invariants`                                  |
 | Side-channel kernel params boot on the hardened kernel                                            | QEMU boot (`just vm`)                                                  |
 
