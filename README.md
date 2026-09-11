@@ -240,8 +240,9 @@ Verified:
 | No key: nothing egresses; ruleset matches design; IPv6 off; no sudo, root locked, doas wheel-only | VM test `gateway-security`                                             |
 | Gateway return traffic to the workstation is permitted (regression)                               | VM test `workstation-return` + eval check `workstation-return-ruleset` |
 | Duress passphrase crypto-erases `/persist`, decoy boots and logs in, no forensic trace            | VM test `duress-wipes-persist`                                         |
-| `update-anon` mechanism keeps `/persist` and retains the old generation                           | VM test `update-keeps-persist`                                         |
+| `update-anon` finds an existing install, and its mechanism keeps `/persist` and retains the old generation | VM test `update-keeps-persist`                                 |
 | One ISO installs to any disk: the closure is device-independent and the `--disk` rewrite is total  | eval check `disk-target-is-runtime-selectable`                         |
+| The existing-install probe reads a real LUKS2 label (regression: it silently never did)           | eval check `luks-label-probe`                                          |
 | Locked root, immutable users, and other option-level invariants can't drift                       | eval check `anon-security-invariants`                                  |
 | Side-channel kernel params boot on the hardened kernel                                            | QEMU boot (`just vm`)                                                  |
 

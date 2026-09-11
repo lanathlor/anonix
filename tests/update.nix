@@ -1,20 +1,29 @@
 ##############################################################################
 # QEMU VM test for the non-destructive update (update-anon).
 #
-# Exercises the exact mechanism update-anon relies on: disko's mount-only script
-# re-opening the existing encrypted volumes, and nixos-install writing a new
-# system over an already-populated /nix + /persist. Asserts that /persist
-# survives, the system profile advances, and the old generation is retained.
+# Covers two things:
 #
-# Uses the real modules/disk.nix layout. Two test-only accommodations (neither
-# changes the update mechanism):
+#  1. The real update-anon script finding an existing install. Built by
+#     mkInstallScripts against the throwaway system below (same source as the
+#     ISO's copy, small closure) and run in the VM. Added after a probe that
+#     never worked survived here for lack of any test calling the script.
+#
+#  2. The mechanism it relies on: disko's mount-only script re-opening the
+#     existing encrypted volumes, and nixos-install writing a new system over
+#     an already-populated /nix + /persist. Asserts /persist survives, the
+#     profile advances, and the old generation is retained.
+#
+# Uses the real modules/disk.nix layout. Test-only accommodations (none of which
+# change the update mechanism):
 #   * LUKS volumes are unlocked from a keyFile instead of an interactive passphrase.
 #   * v1/v2 are minimal systems installed with --no-bootloader. This test does
 #     not cover the lanzaboote/Secure-Boot re-sign path (see docs/updating.md).
+#   * update-anon is driven only to its confirmation prompt, answered "n";
+#     past that point is the mechanism covered in (2).
 #
 # Run: `nix build .#checks.x86_64-linux.update-keeps-persist -L` (or `just test`).
 ##############################################################################
-{ system, nixpkgs, disko }:
+{ system, nixpkgs, disko, mkInstallScripts }:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
@@ -61,6 +70,28 @@ let
   }).config;
   diskoScript = diskoConf.system.build.diskoScript;
   mountScript = diskoConf.system.build.mountScript;
+
+  # The real installer scripts, built against the throwaway v2 system so the
+  # closure stays small. Identical source to the copies on the ISO.
+  scripts = mkInstallScripts {
+    anon = nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        disko.nixosModules.disko
+        testDisk
+        {
+          nixpkgs.hostPlatform = system;
+          documentation.enable = false;
+          boot.loader.systemd-boot.enable = true;
+          boot.loader.efi.canTouchEfiVariables = false;
+          environment.etc."update-test-generation".text = "v2";
+          users.users.root.hashedPassword = "!";
+          system.stateVersion = "26.05";
+        }
+      ];
+    };
+  };
+  updateAnon = scripts.updateAnon;
 in
 pkgs.testers.runNixOSTest {
   name = "update-keeps-persist";
@@ -103,6 +134,25 @@ pkgs.testers.runNixOSTest {
         machine.succeed("printf test-passphrase > /tmp/disk.key")
         # Nothing is open or mounted yet.
         machine.fail("test -e /dev/mapper/nix")
+
+    with subtest("update-anon FINDS the existing install (the real script)"):
+        # "n" stops at the prompt; past it is the mechanism tested below.
+        out = machine.fail("echo n | ${updateAnon}/bin/update-anon 2>&1")
+        assert "Existing anon install detected" in out, (
+            "update-anon did not detect the install it was pointed at; the\n"
+            "LUKS label probe is returning empty for every device.\n" + out
+        )
+        assert "/dev/vdb" in out, f"detection did not report the disk:\n{out}"
+        assert "aborted" in out, f"answering 'n' should abort:\n{out}"
+
+    with subtest("update-anon reports nothing on a disk with no install"):
+        # /dev/vda is the VM's own root disk: real, but not an anon install.
+        out = machine.fail("echo n | ${updateAnon}/bin/update-anon --disk /dev/vda 2>&1")
+        assert "No existing anon install" in out, f"expected a clean miss:\n{out}"
+
+    with subtest("update-anon rejects a partition passed to --disk"):
+        out = machine.fail("${updateAnon}/bin/update-anon --disk /dev/vdb1 2>&1")
+        assert "is a partition" in out, f"whole-disk guard did not fire:\n{out}"
 
     with subtest("update: non-destructive unlock + mount of the EXISTING disk"):
         # Mirror update-anon: disko's mountScript omits the LUKS open for one

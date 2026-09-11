@@ -69,6 +69,21 @@
       # global replace. Shared with tests/disk.nix.
       targetSentinel = "/dev/disk/by-id/ANONIX-INSTALL-TARGET";
 
+      # LUKS2 header label of $1, empty for non-LUKS or unlabelled devices.
+      # Spots an existing anon install by its 'persistcrypt' container.
+      # There is no `luksDumpLabel` action, hence the parse; and cryptsetup
+      # spells "no label" as the literal "(no label)".
+      luksLabel = ''
+        luks_label() {
+          local l
+          cryptsetup isLuks "$1" 2>/dev/null || return 0
+          l=$(cryptsetup luksDump "$1" 2>/dev/null \
+                | sed -n 's/^Label:[[:space:]]*//p' | head -1)
+          if [ "$l" = "(no label)" ]; then l=""; fi
+          printf '%s' "$l"
+        }
+      '';
+
       # install-anon and update-anon, built for a given evaluated system. Kept
       # out of mkInstaller so tests can build them against a throwaway system
       # instead of the full anon closure.
@@ -123,6 +138,7 @@
             runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools mkpasswd gnused gnugrep ];
             text = ''
               ${requireWholeDisk}
+              ${luksLabel}
               disk="${defaultDevice}"
               ${parseDiskFlag}
               if [ "$#" -lt 1 ]; then
@@ -172,7 +188,7 @@
               # Warn if the target already holds an anon install: this command wipes
               # it. update-anon keeps /persist instead.
               while IFS= read -r part; do
-                if [ "$(cryptsetup luksDumpLabel "$part" 2>/dev/null || true)" = persistcrypt ]; then
+                if [ "$(luks_label "$part")" = persistcrypt ]; then
                   echo "WARNING: $part looks like an existing anon /persist (encrypted)." >&2
                   echo "install-anon will destroy it: secrets, Secure Boot keys and the" >&2
                   echo "workstation /home included. To keep /persist and just apply this" >&2
@@ -257,7 +273,7 @@
           # /persist. Rebuild a newer ISO, dd it, boot the target, and run this.
           updateAnon = pkgs.writeShellApplication {
             name = "update-anon";
-            runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools ];
+            runtimeInputs = with pkgs; [ coreutils util-linux cryptsetup nixos-install-tools gnused ];
             text = ''
               # usage: update-anon [--disk <device>] [lan-bypass-ip ...]
               #   With no lan-bypass args the existing /persist/lan-bypass is left
@@ -265,6 +281,7 @@
               #   --disk restricts the search to one disk; by default every disk
               #   is scanned, which is safe because nothing here is wiped.
               ${requireWholeDisk}
+              ${luksLabel}
               disk=""
               ${parseDiskFlag}
               if [ -n "$disk" ]; then
@@ -282,7 +299,7 @@
               while IFS= read -r d; do
                 [ -n "$d" ] || continue
                 while IFS= read -r part; do
-                  if [ "$(cryptsetup luksDumpLabel "$part" 2>/dev/null || true)" = persistcrypt ]; then
+                  if [ "$(luks_label "$part")" = persistcrypt ]; then
                     found="$part"; device="$d"; break
                   fi
                 done < <(lsblk -rno PATH "$d" 2>/dev/null || true)
@@ -500,7 +517,7 @@
       # QEMU VM tests (or `just test`). Do not need the VPN values filled in.
       checks.${system} = {
         update-keeps-persist =
-          import ./tests/update.nix { inherit system nixpkgs disko; };
+          import ./tests/update.nix { inherit system nixpkgs disko mkInstallScripts; };
         duress-wipes-persist =
           import ./tests/duress.nix { inherit system nixpkgs; };
         gateway-security =
@@ -510,6 +527,10 @@
         # Guards the --disk rewrite in mkInstaller (eval-only, no KVM).
         disk-target-is-runtime-selectable =
           import ./tests/disk.nix { inherit system nixpkgs anon targetSentinel; };
+        # Guards the existing-install probe used by install-anon/update-anon
+        # (formats a throwaway LUKS image; no VM, no KVM, no root).
+        luks-label-probe =
+          import ./tests/luks-label.nix { inherit system nixpkgs luksLabel; };
         no-clearnet-leak =
           import ./tests/no-leak.nix { inherit system nixpkgs; };
         # Regression guards for the workstation return-traffic drop: eval-level
