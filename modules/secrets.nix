@@ -15,7 +15,11 @@
   # Put the printed public key into ../secrets/secrets.nix and re-encrypt.
   age.identityPaths = [ "/persist/secrets/age-identity" ];
 
-  age.secrets."vpn-wg" = {
+  # Only declared while the VPN transport is on: with anon.vpn.enable = false
+  # there is no key to decrypt, and agenix would otherwise fail activation on
+  # a placeholder/absent secret. (`or true` keeps this module usable where
+  # vpn.nix is not imported.)
+  age.secrets."vpn-wg" = lib.mkIf (config.anon.vpn.enable or true) {
     file = ../secrets/vpn-wg.key.age;
     # Decrypted to /run/agenix/vpn-wg (root-only); wg-quick runs as root.
     mode = "0400";

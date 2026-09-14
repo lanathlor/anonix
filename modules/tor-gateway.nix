@@ -20,6 +20,13 @@
 # internal-network traffic can never reach the physical NIC; it can only be
 # REDIRECTed into Tor. If Tor is down it has nowhere to go; if the VPN is down
 # Tor has no route. Either failure: zero packets leave.
+#
+# With the VPN disabled (`anon.vpn.enable = false`, direct Tor — see
+# modules/vpn.nix for the trade-off), the tunnel and its rules disappear and
+# the pin moves one layer down: the Tor daemon's own sockets are the only
+# permitted egress, on any interface. Everything that is not Tor (or DHCP)
+# is still dropped, so the box stays fail-closed; the difference is that the
+# ISP-facing traffic is Tor instead of WireGuard.
 ##############################################################################
 { config, lib, pkgs, ... }:
 
@@ -28,6 +35,7 @@ let
   dnsPort = 9053;   # Tor DNS resolver    (redirect :53 here)
   socksPort = 9050; # Tor SOCKS (nix-daemon fetches go here explicitly)
 
+  vpnOn = config.anon.vpn.enable;
   ep = config.anon.vpn.endpointIp;
   epPort = toString config.anon.vpn.endpointPort;
 
@@ -134,11 +142,28 @@ in {
 
     # Start Tor only after the VPN tunnel is up, so it never attempts a
     # connection over the clearnet NIC. The oifname pin in the ruleset is the
-    # hard guarantee; this closes the boot-time race.
-    systemd.services.tor = {
+    # hard guarantee; this closes the boot-time race. Without the VPN there is
+    # no tunnel to wait for: Tor's direct egress is the permitted transport.
+    systemd.services.tor = lib.mkIf vpnOn {
       after = [ "wg-quick-wg-tunnel.service" ];
       wants = [ "wg-quick-wg-tunnel.service" ];
     };
+
+    # Resolver points at loopback; Tor's DNSPort answers (the nat output
+    # chain redirects :53 there). Independent of the VPN choice: DNS must go
+    # through Tor in both modes, or names would leak to the local resolver.
+    networking.nameservers = lib.mkForce [ "127.0.0.1" ];
+    services.resolved.enable = false;
+    networking.dhcpcd.extraConfig = "nohook resolv.conf";
+
+    # Direct-Tor mode is a deliberate posture change; make it visible at
+    # build time so it can never be an accident.
+    warnings = lib.optional (!vpnOn) ''
+      anonix: anon.vpn.enable is false (direct Tor). The killswitch pins
+      egress to the Tor daemon alone; fail-closed still holds, but your ISP
+      can observe that this machine uses Tor (not what it does through it).
+      Set anon.vpn.enable = true and fill in anon.vpn.* to hide Tor usage
+      behind a WireGuard tunnel.'';
 
     # Apply the runtime LAN-bypass list. Reads ${bypassFile} (one IPv4 per
     # line, # comments allowed), fills the nftables `lan_bypass` sets, and
@@ -258,9 +283,10 @@ in {
           ct state established,related accept
           ct state invalid drop
 
+          ${lib.optionalString vpnOn ''
           # Encrypted WireGuard packets coming back from the VPN server.
           ip saddr ${ep} udp sport ${epPort} accept
-
+          ''}
           # DHCP replies (obtain a LAN address on the physical NIC).
           udp sport 67 udp dport 68 accept
           ${lib.optionalString int.enable ''
@@ -301,6 +327,7 @@ in {
           oifname "${int.interface}" ct state established,related accept
           ''}
 
+          ${if vpnOn then ''
           # Return traffic only on the VPN tunnel. A blanket "ct state
           # established accept" on every interface would let in-flight Tor streams
           # spill onto the clearnet NIC if the tunnel drops. The WireGuard packets
@@ -318,7 +345,19 @@ in {
           # Encrypted WireGuard packets to the VPN endpoint (kernel-generated,
           # no socket uid; must be allowed by destination address).
           ip daddr ${ep} udp dport ${epPort} accept
+          '' else ''
+          # Direct-Tor mode (anon.vpn.enable = false): no tunnel exists, so
+          # the pin is the Tor daemon itself. Its sockets may egress on any
+          # interface; every other process still hits the default drop.
+          meta skuid ${torUid} accept
 
+          # Kernel-generated packets of already-permitted flows (RSTs, ACKs
+          # without a socket, so no skuid to match). Safe without an oifname
+          # pin here: a flow only becomes established if its first packet was
+          # accepted above (Tor, DHCP, loopback) — a non-Tor process can never
+          # get a new flow past the drop policy to piggyback on.
+          ct state established,related accept
+          ''}
           # DHCP requests to get on the LAN.
           udp sport 68 udp dport 67 accept
 
@@ -337,11 +376,12 @@ in {
     '';
 
     assertions = [{
-      assertion = config.anon.vpn.endpointIp != "PLACEHOLDER_ENDPOINT_IP";
+      assertion = !vpnOn || ep != "PLACEHOLDER_ENDPOINT_IP";
       message = ''
         anon.vpn.endpointIp is still the placeholder. Fill in
         modules/vpn.nix before deploying; the killswitch needs the real
-        endpoint IP to allow WireGuard packets out. (Bypassed in the QEMU test.)
+        endpoint IP to allow WireGuard packets out. (Bypassed in the QEMU
+        test. Not needed with anon.vpn.enable = false.)
       '';
     }];
   };

@@ -1,6 +1,6 @@
 {
   description =
-    "anonix — maximal-anonymity NixOS: mandatory transparent Tor gateway routed over a WireGuard VPN tunnel (any provider), with root-on-tmpfs impermanence. Killswitch by construction: if either Tor or the VPN is down, no packet leaves the machine.";
+    "anonix — maximal-anonymity NixOS: mandatory transparent Tor gateway, by default routed over a WireGuard VPN tunnel (any provider; optional, anon.vpn.enable), with root-on-tmpfs impermanence. Killswitch by construction: if Tor — or the VPN, when enabled — is down, no packet leaves the machine.";
 
   inputs = {
     # Pin a stable channel. Re-audit the firewall after upgrades.
@@ -357,6 +357,10 @@
         let
           inherit (mkInstallScripts { inherit anon; })
             installAnon updateAnon defaultDevice;
+          installReadme = mkInstallReadme {
+            inherit defaultDevice;
+            vpnOn = anon.config.anon.vpn.enable;
+          };
         in
         nixpkgs.lib.nixosSystem {
           inherit system;
@@ -364,7 +368,7 @@
             ({ modulesPath, lib, pkgs, ... }: {
               imports = [ (modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix") ];
               environment.systemPackages = [ installAnon updateAnon pkgs.mkpasswd pkgs.age pkgs-unstable.vim ];
-              systemd.tmpfiles.rules = [ "C /root/README.md 0644 root root - ${mkInstallReadme defaultDevice}" ];
+              systemd.tmpfiles.rules = [ "C /root/README.md 0644 root root - ${installReadme}" ];
               services.getty.helpLine = lib.mkForce ''
 
                 >>> Offline installer. Run:  cat README.md
@@ -384,10 +388,33 @@
         };
 
       # Cheat sheet placed at /root/README.md on the live ISO.
-      # Takes the ISO's default install target so the text can name it.
-      mkInstallReadme = defaultDevice: pkgs.writeText "README.md" ''
+      # Takes the ISO's default install target so the text can name it, and
+      # whether the baked system uses the VPN transport (anon.vpn.enable) so
+      # the identity and verification steps match the installed reality.
+      mkInstallReadme = { defaultDevice, vpnOn }:
+        let
+          # Plain strings (not indented ''-strings): multi-line values keep
+          # their leading spaces when spliced into the readme below.
+          identityNote =
+            if vpnOn then
+              "    Without it the box boots but cannot decrypt the VPN key and stays offline.\n"
+              + "    (It must be the same identity used at build time; a fresh one won't\n"
+              + "     match the baked, encrypted VPN key.)"
+            else
+              "    (This build has the VPN transport disabled — Tor egresses directly,\n"
+              + "     and no baked secret depends on the identity — but install it anyway:\n"
+              + "     an update that re-enables the VPN will need this same identity.)";
+          verifyNote =
+            if vpnOn then
+              "  doas wg-quick down wg-tunnel && curl -m5 https://example.com   # must fail"
+            else
+              "  Direct-Tor build: no tunnel to tear down. The killswitch pins egress\n"
+              + "  to the Tor daemon; stop it to confirm fail-closed:\n"
+              + "  doas systemctl stop tor && curl -m5 https://example.com   # must fail";
+        in
+        pkgs.writeText "README.md" ''
         ================================================================
-         anonix OFFLINE INSTALLER  (anon: Tor-over-VPN + isolated WS)
+         anonix OFFLINE INSTALLER  (anon: ${if vpnOn then "Tor-over-VPN" else "direct Tor, no VPN"} + isolated WS)
         ================================================================
         This USB installs the whole system onto this machine. Everything is baked
         in; no network is used. It wipes the disk you point it at.
@@ -404,9 +431,7 @@
             ISO with. Copy your `age-identity` file here, e.g. from a USB stick:
               mkdir -p /mnt/usb && mount /dev/sdX1 /mnt/usb
               cp /mnt/usb/age-identity /root/age-identity
-            Without it the box boots but cannot decrypt the VPN key and stays offline.
-            (It must be the same identity used at build time; a fresh one won't
-             match the baked, encrypted VPN key.)
+        ${identityNote}
 
         (b) nothing to prepare for passwords: the installer prompts you in
             step 3 to set the gateway and workstation login passwords (it hashes
@@ -457,7 +482,7 @@
 
         ---- Verify (on the installed system, after first boot) ------------------
           curl https://check.torproject.org/api/ip                  # IsTor: true
-          doas wg-quick down wg-tunnel && curl -m5 https://example.com   # must fail
+        ${verifyNote}
 
         Tools here: install-anon, update-anon, mkpasswd, age, lsblk, cryptsetup, vim.
         Change the LAN bypass later on the box: edit /persist/lan-bypass.
@@ -553,6 +578,13 @@
           import ./tests/killswitch-egress.nix { inherit system nixpkgs; };
         killswitch-gateway-down =
           import ./tests/killswitch-gateway-down.nix { inherit system nixpkgs; };
+        # The VPN transport is optional (anon.vpn.enable). Direct-Tor mode is
+        # guarded twice: eval-level ruleset/config invariants (no KVM), and a
+        # booted VM proving Tor may egress directly while all else drops.
+        no-vpn-ruleset =
+          import ./tests/no-vpn-ruleset.nix { inherit system nixpkgs; };
+        no-vpn-direct =
+          import ./tests/no-vpn-direct.nix { inherit system nixpkgs; };
       };
 
       # Dev shell (`nix develop`). A devShell cannot provide KVM; /dev/kvm is a

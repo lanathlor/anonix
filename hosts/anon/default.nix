@@ -48,6 +48,13 @@
   # allocator; enable there only after testing.
   anon.sideChannel.hardenedMalloc = true;
 
+  # Tor-over-VPN (the default). Set false for direct Tor: Tor then connects
+  # over the physical NIC itself — no VPN provider, subscription, or
+  # anon.vpn.* values needed, and the killswitch pins egress to the Tor
+  # daemon instead of the tunnel. Trade-off: your ISP sees that you use Tor
+  # (never what you do through it). See modules/vpn.nix and README "VPN".
+  anon.vpn.enable = true;
+
   # Duress passphrase: a second boot passphrase that crypto-erases /persist and
   # boots a clean decoy (plausible deniability under coercion). See duress.nix.
   # Incompatible with TPM2 auto-unlock (requires a typed passphrase at boot),

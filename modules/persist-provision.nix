@@ -89,8 +89,12 @@ in
         system.activationScripts.users.deps = [ "persistProvision" ];
       }
       (lib.optionalAttrs ageDeclared {
-        # Identity must exist before agenix tries to use it.
-        system.activationScripts.agenixNewGeneration.deps = [ "persistProvision" ];
+        # Identity must exist before agenix tries to use it. Only when some
+        # secret is declared: with none (e.g. anon.vpn.enable = false drops
+        # the only one), agenix emits no activation script, and a bare `deps`
+        # entry would materialize a scriptless, failing activation step.
+        system.activationScripts.agenixNewGeneration =
+          lib.mkIf (config.age.secrets != { }) { deps = [ "persistProvision" ]; };
         # Tolerate decrypt failure (fresh duress identity) so boot never aborts.
         age.ageBin = lib.mkIf duressOn (lib.mkForce "${tolerantAge}");
       })
