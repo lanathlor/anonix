@@ -522,6 +522,14 @@
           import ./tests/duress.nix { inherit system nixpkgs; };
         gateway-security =
           import ./tests/security.nix { inherit system nixpkgs; };
+        # The workstation microVM launches and boots (needs nested KVM).
+        workstation-starts =
+          import ./tests/workstation-starts.nix { inherit system nixpkgs microvm; };
+        # Field repro: the gateway on a machine WITHOUT /dev/kvm (VT-x off in
+        # firmware). Pins the observed failure -- microvm@ crash-loops on the
+        # qemu KVM error and login dead-ends in the viewer's socket error.
+        workstation-no-kvm-repro =
+          import ./tests/workstation-no-kvm.nix { inherit system nixpkgs microvm; };
         anon-security-invariants =
           import ./tests/invariants.nix { inherit system nixpkgs; config = anon.config; };
         # Guards the --disk rewrite in mkInstaller (eval-only, no KVM).
