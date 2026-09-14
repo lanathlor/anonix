@@ -184,6 +184,34 @@ in {
     hashedPasswordFile = "/run/ws-secrets/user.passwd";
     extraGroups = [ "wheel" "wireshark" ]; # wireshark => rootless packet capture
   };
+
+  # hashedPasswordFile alone never works here. It is read by
+  # update-users-groups.pl during activation, which runs in stage-2 init
+  # *before* systemd mounts anything from fstab -- and /run/ws-secrets is a 9p
+  # mount (the ro-store share carries x-initrd.mount, this one does not). So
+  # the file is absent at exactly the moment the password would be set, the
+  # account is locked on every boot, and no password can log into the desktop.
+  # Apply the hash once the share is really mounted, before SDDM offers a login.
+  systemd.services.ws-user-password = {
+    description = "Apply the workstation login hash from the ws-secrets share";
+    wantedBy = [ "multi-user.target" ];
+    requires = [ "run-ws\\x2dsecrets.mount" ];
+    after = [ "run-ws\\x2dsecrets.mount" ];
+    before = [ "display-manager.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    path = [ pkgs.shadow pkgs.coreutils ];
+    script = ''
+      if [ -r /run/ws-secrets/user.passwd ]; then
+        usermod -p "$(cat /run/ws-secrets/user.passwd)" user
+        echo "applied the login hash for user"
+      else
+        echo "no /run/ws-secrets/user.passwd: leaving the account locked" >&2
+      fi
+    '';
+  };
   # doas instead of sudo (see hosts/anon/default.nix for rationale).
   security.sudo.enable = false;
   security.doas = {
