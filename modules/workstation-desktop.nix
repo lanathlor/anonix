@@ -33,10 +33,17 @@ in {
     #   extraArgs: export the GL framebuffer over a SPICE unix socket plus the
     #              spice-vdagent channel (clipboard/resize).
     ##########################################################################
+    # Must stay on: it selects the full-featured qemu (the minimal one has no
+    # SPICE support at all -- "-spice: invalid option") and emits
+    # `-display egl-headless -device virtio-gpu-gl`.
     microvm.graphics.enable = true;
     microvm.graphics.backend = "headless";
     microvm.qemu.extraArgs = [
-      "-spice" "unix=on,addr=${spiceSock},disable-ticketing=on,gl=on"
+      # No gl=on: egl-headless (above) already holds qemu's GL context, and
+      # asking SPICE for a second one makes qemu exit with "The console
+      # already has an OpenGL context", leaving a stale socket the viewer
+      # attaches to and then fails against.
+      "-spice" "unix=on,addr=${spiceSock},disable-ticketing=on"
       "-device" "virtio-serial-pci"
       "-chardev" "spicevmc,id=vdagent,name=vdagent"
       "-device" "virtserialport,chardev=vdagent,name=com.redhat.spice.0"

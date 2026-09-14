@@ -81,18 +81,25 @@ in {
       # (modules/side-channel.nix) a post-boot module load is the fragile
       # case; loading them here surfaces any problem at boot instead of
       # silently failing to launch the workstation. All are in-tree (signed
-      # with the kernel's build key); kvm pulls in its vendor submodule
-      # (kvm-intel/kvm-amd) itself. The host GPU driver is hardware-specific
+      # with the kernel's build key). The host GPU driver is hardware-specific
       # and loads via initrd/udev.
-      boot.kernelModules = [ "kvm" "tun" "vhost" "vhost_net" ];
+      #
+      # Both vendor modules are listed because it is kvm-intel/kvm-amd, not
+      # kvm, that creates /dev/kvm -- kvm is their dependency, not their
+      # loader. Whichever does not match the CPU fails to load harmlessly.
+      # If /dev/kvm is still missing, virtualisation is off in the firmware.
+      boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tun" "vhost" "vhost_net" ];
 
       # Backing directory for the workstation's persistent /home volume.
       # Lives on the host's LUKS-encrypted /persist so the guest's keys,
       # passwords and dev work survive reboots and are encrypted at rest.
-      # 0700 root: only the (root-run) microVM service reaches the raw image.
+      # Owned by the unprivileged user microvm@.service actually runs as, not
+      # root: it creates the image itself on first boot. 0700 still means only
+      # the microVM reaches the raw image; 0711 on the parent lets it traverse
+      # without listing. Pinned by the invariants check.
       systemd.tmpfiles.rules = [
-        "d /persist/microvms 0700 root root - -"
-        "d /persist/microvms/workstation 0700 root root - -"
+        "d /persist/microvms 0711 root root - -"
+        "d /persist/microvms/workstation 0700 microvm kvm - -"
         # Source dir for the workstation's `ws-secrets` 9p share (login-hash
         # file written by the installer). 0755 so the share is readable
         # whether qemu runs as root or the unprivileged microvm user. The
@@ -100,6 +107,24 @@ in {
         # per-install password hash.
         "d /persist/ws-secrets 0755 root root - -"
       ];
+
+      # The GPU stack belongs to whoever needs it, which is the microVM: with
+      # the desktop on, qemu uses egl-headless + virtio-gpu-gl and loads Mesa's
+      # GBM driver from /run/opengl-driver, which only hardware.graphics.enable
+      # populates. It must be set HERE, not left to workstation-viewer.nix: a
+      # headless gateway (viewer off, a documented option) still runs the
+      # microVM, which without this dies on startup with "gbm_create_device
+      # failed". The viewer enables it too, for cage; both being true is fine.
+      hardware.graphics.enable = lib.mkIf cfg.desktop.enable true;
+
+      # qemu runs unprivileged (User=microvm, Group=kvm). With the desktop on
+      # it also needs the GPU: workstation-desktop.nix asks for virtio-gpu-gl,
+      # egl-headless and `-spice gl=on`, all of which open /dev/dri/renderD128
+      # (root:render on real hardware). Without these groups qemu creates the
+      # SPICE socket, fails to initialise GL and exits, leaving a stale socket
+      # the viewer can see but not connect to. Pinned by the invariants check.
+      systemd.services."microvm@".serviceConfig.SupplementaryGroups =
+        lib.mkIf cfg.desktop.enable [ "render" "video" ];
 
       # Turn the Tor gateway into a transparent proxy for the internal network.
       anon.torGateway.internal = {

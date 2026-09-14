@@ -54,6 +54,47 @@ let
         || (let u = (c.systemd.services."microvm@" or { serviceConfig = { }; })
                       .serviceConfig.User or null;
             in u != null && u != "root" && u != "0"); }
+    # qemu runs as an unprivileged user, but three separate places assumed it
+    # was root: the volume dir (0700 root:root, so home.img could not be
+    # created), the KVM module comment, and the GPU render node. Rather than
+    # pin each, walk every path the VM is configured to need and check the
+    # tmpfiles rule governing it. A new share or volume with a root-owned
+    # directory fails here instead of on someone's hardware.
+    { name = "every path the unprivileged microVM needs is reachable by it";
+      ok = !c.anon.workstation.enable || (
+        let
+          svcUser = c.systemd.services."microvm@".serviceConfig.User or null;
+          vm = c.microvm.vms.workstation.config.config.microvm;
+          # tmpfiles fields: type path mode user group age argument
+          fields = r: lib.filter (s: s != "") (lib.splitString " " r);
+          ruleFor = p: lib.findFirst
+            (r: let f = fields r; in lib.elemAt f 0 == "d" && lib.elemAt f 1 == p)
+            null c.systemd.tmpfiles.rules;
+          ownerOf = r: lib.elemAt (fields r) 3;
+          # "other" digit of the mode, e.g. 0711 -> 1, 0755 -> 5
+          otherBits = r: let m = lib.elemAt (fields r) 2;
+                         in lib.toInt (lib.substring (lib.stringLength m - 1) 1 m);
+          # Writable: must be ours. Readable: ours, or r+x for other.
+          writable = p: let r = ruleFor p;
+                        in r != null && ownerOf r == svcUser;
+          readable = p: let r = ruleFor p;
+                        in r == null || ownerOf r == svcUser || otherBits r >= 5;
+        in svcUser != null
+           && vm.volumes != [ ]
+           && lib.all (v: writable (builtins.dirOf v.image)) vm.volumes
+           && lib.all (s: readable s.source) vm.shares);
+    }
+    # `-spice gl=on` opens /dev/dri/renderD128, but qemu runs unprivileged.
+    # Without render access it created the socket, failed GL and exited, so the
+    # viewer found a stale socket and reported "unable to connect".
+    { name = "if the microVM asks for GL, qemu can reach the render node";
+      ok = !(c.anon.workstation.enable && c.anon.workstation.desktop.enable) || (
+        let
+          args = c.microvm.vms.workstation.config.config.microvm.qemu.extraArgs or [ ];
+          wantsGl = lib.any (a: lib.hasInfix "gl=on" a) args;
+          groups = c.systemd.services."microvm@".serviceConfig.SupplementaryGroups or [ ];
+        in !wantsGl || lib.elem "render" groups);
+    }
     { name = "no unproxied NTP";
       ok = c.services.timesyncd.enable == false; }
     { name = "volatile journald (no on-disk logs)";
