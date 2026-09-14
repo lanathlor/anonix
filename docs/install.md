@@ -13,7 +13,8 @@ doas age-keygen -o /persist/secrets/age-identity      # prints "Public key: age1
 
 # 2. Put that public key (and your own admin key) into secrets/secrets.nix.
 
-# 3. Encrypt your VPN's WireGuard private key into the repo:
+# 3. Encrypt your VPN's WireGuard private key into the repo
+#    (skip when anon.vpn.enable = false — direct Tor needs no key):
 cd secrets
 nix run ..#agenix -- -e vpn-wg.key.age                # paste only the PrivateKey value
 git add vpn-wg.key.age                                # safe: it's encrypted
@@ -33,17 +34,22 @@ boots on essentially any x86_64 box. Fill in these before building:
    drive. Nothing else depends on it — every mount resolves through the
    partition and LUKS labels, which the `disk-target-is-runtime-selectable`
    check enforces.
-2. **VPN.** Any WireGuard provider works (Mullvad, IVPN, ProtonVPN, AzireVPN,
-   or one you host). Generate a WireGuard config and fill the non-secret
-   values in `modules/vpn.nix`: `endpointIp`, `endpointPort`,
-   `serverPublicKey`, `interfaceAddress`. Encrypt the private key with agenix
-   (above); it never touches git in plaintext. (Mullvad example: log in at
-   <https://mullvad.net> → Account → WireGuard configuration.)
+2. **VPN (optional, default on).** Any WireGuard provider works (Mullvad,
+   IVPN, ProtonVPN, AzireVPN, or one you host). Generate a WireGuard config
+   and fill the non-secret values in `modules/vpn.nix`: `endpointIp`,
+   `endpointPort`, `serverPublicKey`, `interfaceAddress`. Encrypt the private
+   key with agenix (above); it never touches git in plaintext. (Mullvad
+   example: log in at <https://mullvad.net> → Account → WireGuard
+   configuration.) Alternatively set `anon.vpn.enable = false` for direct Tor
+   — none of these values or the key are then needed, the build warns about
+   the posture change, and your ISP sees Tor usage instead of WireGuard (see
+   the README's "VPN setup" section for the trade-off).
 3. **Age identity.** One file goes onto the encrypted `/persist` at install
    time (not into git, not into the ISO): the machine's age identity
    (`age-keygen -o age-identity`). Its public key goes into
-   `secrets/secrets.nix`, and you re-encrypt the VPN key to it. Login
-   passwords are prompted by the installer and hashed onto `/persist`.
+   `secrets/secrets.nix`, and you re-encrypt the VPN key to it (when the VPN
+   is enabled). Login passwords are prompted by the installer and hashed onto
+   `/persist`.
 
 Then build the live-USB installer (recommended, below) or, on an
 already-running NixOS, `just check && doas nixos-rebuild switch --flake .#anon`.
@@ -105,6 +111,15 @@ doas systemd-run -qt -p 'AmbientCapabilities=CAP_NET_ADMIN' \
 doas systemd-run -qt -p 'AmbientCapabilities=CAP_NET_ADMIN' \
   -p 'CapabilityBoundingSet=CAP_NET_ADMIN' wg-quick down wg-tunnel
 curl -m 5 https://example.com                    # must fail
+```
+
+On a direct-Tor build (`anon.vpn.enable = false`) there is no tunnel to tear
+down; the equivalent fail-closed check is stopping Tor itself:
+
+```sh
+doas systemctl stop tor
+curl -m 5 https://example.com                    # must fail
+doas systemctl start tor
 ```
 
 [disko]: https://github.com/nix-community/disko

@@ -7,22 +7,28 @@
 > you, use Whonix, Tails, or Qubes instead.
 
 A NixOS flake for maximal anonymity. Every application is forced through Tor,
-Tor rides a WireGuard VPN tunnel, and the firewall drops everything else. If
-either layer is down, no packet leaves the machine.
+Tor by default rides a WireGuard VPN tunnel, and the firewall drops everything
+else. If either layer is down, no packet leaves the machine.
 
 The VPN is any WireGuard provider you choose (Mullvad, IVPN, ProtonVPN,
-AzireVPN, or a WireGuard server you host yourself) — see [VPN setup](#vpn-setup-required)
-below. Mullvad is used as the running example.
+AzireVPN, or a WireGuard server you host yourself) — see
+[VPN setup](#vpn-setup-optional-default-on) below. Mullvad is used as the
+running example. It is also optional: `anon.vpn.enable = false` switches to
+direct Tor (no provider needed; your ISP then sees Tor usage, never its
+content).
 
 - **Transparent Tor gateway.** All TCP and DNS is redirected into Tor. There
   is no way to send unproxied traffic.
-- **Tor-over-VPN.** Your ISP sees only WireGuard to your VPN endpoint, never
-  Tor or clearnet.
-- **Hard killswitch.** The firewall drops by default. The only allowed egress
-  is the Tor daemon's own sockets, pinned to `wg-tunnel`, plus the encrypted
-  WireGuard packets to the VPN endpoint. If the tunnel drops, Tor's packets are
-  dropped too; they cannot fall back to the physical NIC. No IPv6, no stray
-  UDP, no clearnet Tor.
+- **Tor-over-VPN (default).** Your ISP sees only WireGuard to your VPN
+  endpoint, never Tor or clearnet. Optional: disable the VPN layer for
+  direct Tor, like Whonix or Tor Browser use out of the box.
+- **Hard killswitch, in both modes.** The firewall drops by default. With the
+  VPN, the only allowed egress is the Tor daemon's own sockets, pinned to
+  `wg-tunnel`, plus the encrypted WireGuard packets to the VPN endpoint; if
+  the tunnel drops, Tor's packets are dropped too — they cannot fall back to
+  the physical NIC. Without the VPN, the pin moves to the Tor daemon itself:
+  its sockets are the only thing that may leave the machine. No IPv6, no
+  stray UDP, no unproxied clearnet — ever.
 - **Impermanence.** Root is tmpfs and wiped every boot. Only a short list of
   paths under `/persist` survives.
 - **Encrypted at rest.** `/nix` and `/persist` are LUKS-encrypted. Imaging the
@@ -36,14 +42,42 @@ below. Mullvad is used as the running example.
 ```
 apps ─▶ Tor (transparent proxy) ─▶ VPN tunnel ─▶ Tor guard ─▶ Tor net ─▶ exit ─▶ Internet
        (nft nat redirect)          (default route)   (as user `tor`)
+
+# with anon.vpn.enable = false (direct Tor):
+apps ─▶ Tor (transparent proxy) ─▶ Tor guard ─▶ Tor net ─▶ exit ─▶ Internet
+       (nft nat redirect)          (as user `tor`, over the physical NIC)
 ```
 
-## VPN setup (required)
+## VPN setup (optional, default on)
 
-The VPN tunnel is **required** — it is the transport Tor rides, and the
-killswitch is built around it (Tor may only egress on the `wg-tunnel`
-interface). What you choose is the _provider_: any WireGuard endpoint works.
-Fill four non-secret values plus the encrypted private key in
+The VPN tunnel is the **default transport** Tor rides, and the killswitch is
+built around whichever transport is active. One option selects the mode:
+
+```nix
+anon.vpn.enable = true;   # Tor-over-VPN (default) — fill in the values below
+anon.vpn.enable = false;  # direct Tor — nothing below is needed
+```
+
+**Which one do you want?**
+
+| | Tor-over-VPN (`enable = true`) | Direct Tor (`enable = false`) |
+| --- | --- | --- |
+| Your ISP sees | only WireGuard to the VPN endpoint | that you connect to Tor (never what you do through it) |
+| Your VPN provider sees | that you use Tor | — (no provider involved) |
+| Needs | a WireGuard endpoint + the values below | nothing |
+| Killswitch pins egress to | the `wg-tunnel` interface | the Tor daemon's own sockets |
+
+Both modes are fail-closed: anything that is not the permitted transport is
+dropped, and both are machine-checked (`no-clearnet-leak`/`killswitch-egress`
+for the tunnel, `no-vpn-ruleset`/`no-vpn-direct` for direct Tor). Choose
+direct Tor when Tor usage itself is not dangerous where you live, or when you
+have no VPN you trust more than your ISP; if you need to hide Tor from a
+hostile network but trust no VPN either, Tor bridges are not integrated here —
+use Whonix or Tails instead. Disabling the VPN is deliberately loud: the
+build emits a warning so the posture change can never be an accident.
+
+With the VPN enabled, what you choose is the _provider_: any WireGuard
+endpoint works. Fill four non-secret values plus the encrypted private key in
 `modules/vpn.nix`, under the `anon.vpn` options:
 
 ```nix
@@ -72,7 +106,9 @@ full flow is in [docs/install.md](docs/install.md).
 Defends against:
 
 - **Your ISP or local network observer.** Sees only WireGuard to your VPN
-  endpoint. No Tor, no clearnet, no hostname, per-boot random MAC.
+  endpoint. No Tor, no clearnet, no hostname, per-boot random MAC. (With
+  `anon.vpn.enable = false` the ISP instead sees Tor usage — a deliberate,
+  build-time-warned trade-off; the content stays invisible either way.)
 - **Application and OS-level leaks.** Default-drop killswitch on the gateway;
   the workstation has no route to the physical NIC at all.
 - **Disk theft or imaging.** LUKS on `/nix` and `/persist`, amnesic tmpfs
@@ -118,11 +154,13 @@ properties:
   including what is *not* proven). The other projects are certainly tested,
   but don't ship an automated "these properties hold on this exact build"
   gate you can re-run yourself.
-- **Tor-over-VPN is the architecture, not an option.** Whonix and Tails can
-  be combined with a VPN, with well-documented caveats and manual setup.
-  Here the WireGuard tunnel is the only surface Tor may egress on, enforced
-  by one nftables rule: your ISP never sees Tor, and there is no
-  configuration in which it could.
+- **Tor-over-VPN is the default architecture, not an add-on.** Whonix and
+  Tails can be combined with a VPN, with well-documented caveats and manual
+  setup. Here the WireGuard tunnel is, by default, the only surface Tor may
+  egress on, enforced by one nftables rule: your ISP never sees Tor. The one
+  sanctioned alternative is `anon.vpn.enable = false` (direct Tor), which
+  re-pins the same killswitch to the Tor daemon itself — there is no
+  configuration in which unproxied traffic leaves the machine.
 - **Gateway/workstation isolation on one machine, without a desktop
   hypervisor stack.** Whonix's two-VM split needs VirtualBox/KVM on a host
   OS you also have to trust; Qubes does it best but demands dedicated,
@@ -162,7 +200,7 @@ hosts/anon/
 modules/
   disk.nix                     # disko: declarative GPT + LUKS + tmpfs layout
   tor-gateway.nix              # Tor transparent proxy + nftables killswitch (the core)
-  vpn.nix                      # WireGuard VPN full tunnel, any provider (raw wg-quick)
+  vpn.nix                      # optional WireGuard VPN full tunnel, any provider (raw wg-quick)
   secrets.nix                  # agenix wiring (identity on /persist)
   impermanence.nix             # tmpfs root + the /persist keep-list
   hardening.nix                # MAC randomization, sysctls, capability bounding
@@ -212,8 +250,9 @@ Three inputs, then one command; see [docs/install.md](docs/install.md) for
 the details:
 
 1. Fill your VPN's WireGuard values in `modules/vpn.nix` and encrypt the
-   private key with agenix (see [VPN setup](#vpn-setup-required); Mullvad is
-   the running example, any WireGuard provider works).
+   private key with agenix (see [VPN setup](#vpn-setup-optional-default-on);
+   Mullvad is the running example, any WireGuard provider works). Skip this
+   step entirely if you set `anon.vpn.enable = false` (direct Tor).
 2. Create the machine's age identity and register its public key in
    `secrets/secrets.nix`.
 
@@ -239,6 +278,7 @@ Verified:
 | Gateway down: the workstation loses all connectivity (no second route)                            | VM test `killswitch-gateway-down`                                      |
 | No key: nothing egresses; ruleset matches design; IPv6 off; no sudo, root locked, doas wheel-only | VM test `gateway-security`                                             |
 | Gateway return traffic to the workstation is permitted (regression)                               | VM test `workstation-return` + eval check `workstation-return-ruleset` |
+| Direct Tor (`anon.vpn.enable = false`): Tor may egress, all else drops, no tunnel rule survives   | VM test `no-vpn-direct` + eval check `no-vpn-ruleset`                  |
 | Duress passphrase crypto-erases `/persist`, decoy boots and logs in, no forensic trace            | VM test `duress-wipes-persist`                                         |
 | `update-anon` finds an existing install, and its mechanism keeps `/persist` and retains the old generation | VM test `update-keeps-persist`                                 |
 | One ISO installs to any disk: the closure is device-independent and the `--disk` rewrite is total  | eval check `disk-target-is-runtime-selectable`                         |

@@ -21,8 +21,8 @@ physical NIC ── Gateway/host (Tor + VPN + killswitch)
   amnesic (root on tmpfs) except `/home`, which persists (below).
 
 If Tor is down, the gateway drops the workstation's packets. If the VPN is
-down, Tor cannot egress. Either way there is no second route to remove,
-because there never was one. You do your actual work in the workstation:
+down (when enabled — it is optional, `anon.vpn.enable`), Tor cannot egress.
+Either way there is no second route to remove, because there never was one. You do your actual work in the workstation:
 
 ```sh
 doas microvm -l                       # list running microVMs

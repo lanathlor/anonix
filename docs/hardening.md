@@ -74,7 +74,10 @@ doas systemd-run -qt -p 'AmbientCapabilities=CAP_NET_ADMIN' \
 ## Design notes & caveats
 
 - **Tor-over-VPN** hides Tor usage from your ISP and stops if either layer
-  fails. It does not hide from your VPN provider that Tor is in use.
+  fails. It does not hide from your VPN provider that Tor is in use. The VPN
+  layer is optional: `anon.vpn.enable = false` (direct Tor) drops it, the
+  killswitch re-pins to the Tor daemon's own sockets, and the ISP sees Tor
+  usage instead of WireGuard — the build warns so this is never accidental.
 - **Updates never touch the anonymised uplink**; see [updating](updating.md).
   By default the box carries no nix at all and cannot mutate itself.
 - **UDP can't be transparently torified** and is dropped (except DNS, which
