@@ -34,12 +34,21 @@ let
 
   # Wait for the VM's SPICE socket, then show it fullscreen; re-attach if the
   # VM (or the viewer) restarts.
+  # Everything here logs to the journal under `ws-viewer`: a viewer that
+  # cannot attach shows only a black screen, so `journalctl -t ws-viewer`
+  # is the only place the reason can surface.
   kiosk = pkgs.writeShellScript "ws-viewer" ''
     set -u
+    log() { echo "$*" | ${pkgs.systemd}/bin/systemd-cat -t ws-viewer -p info; }
     while true; do
-      until [ -S "${spiceSock}" ]; do sleep 1; done
-      ${virtViewer}/bin/remote-viewer --full-screen \
-        "spice+unix://${spiceSock}" || true
+      if [ ! -S "${spiceSock}" ]; then
+        log "waiting for the workstation SPICE socket (${spiceSock}); is microvm@workstation running?"
+        until [ -S "${spiceSock}" ]; do sleep 1; done
+      fi
+      log "attaching to ${spiceSock}"
+      ${virtViewer}/bin/remote-viewer --full-screen "spice+unix://${spiceSock}" 2>&1 \
+        | ${pkgs.systemd}/bin/systemd-cat -t ws-viewer -p warning || true
+      log "viewer exited; retrying in 2s"
       sleep 2
     done
   '';
@@ -61,7 +70,17 @@ in {
     };
     systemd.services.spice-sock-perms = {
       description = "Grant ${viewerUser} access to the workstation SPICE socket";
+      # A .path with PathExists= reactivates the moment its triggered unit
+      # finishes, so a plain oneshot here restarts forever while the socket
+      # exists. RemainAfterExit keeps it active and breaks that loop; partOf
+      # ties it to the VM so stopping the VM releases it and the next socket
+      # re-arms the path. (Rate-limiting instead just swaps a spin for a unit
+      # that hits start-limit-hit and stays dead, leaving the socket
+      # root-owned.) Both failure modes are covered by tests/workstation-starts.
+      partOf = [ "microvm@workstation.service" ];
+      startLimitIntervalSec = 0;
       serviceConfig.Type = "oneshot";
+      serviceConfig.RemainAfterExit = true;
       path = [ pkgs.coreutils ];
       script = ''chown ${viewerUser} "${spiceSock}" || true'';
     };
