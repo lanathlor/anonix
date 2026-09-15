@@ -547,9 +547,20 @@
           import ./tests/duress.nix { inherit system nixpkgs; };
         gateway-security =
           import ./tests/security.nix { inherit system nixpkgs; };
-        # The workstation microVM launches and boots (needs nested KVM).
+        # The workstation microVM launches, and the viewer attaches to it and
+        # stays attached (needs nested KVM).
         workstation-starts =
           import ./tests/workstation-starts.nix { inherit system nixpkgs microvm; };
+        # The same, plus the guest finishing its own boot. Split out because it
+        # cannot pass on a GitHub-hosted runner -- the runner is a VM, so the
+        # guest is L3 and traps its way through driver init at a small fraction
+        # of the speed it boots on real hardware. CI skips this one by name
+        # (.github/workflows/ci.yml); `just test` and `just test-ws-guest` run
+        # it, which is where it belongs: a machine whose KVM is the host's.
+        workstation-guest-boots = import ./tests/workstation-starts.nix {
+          inherit system nixpkgs microvm;
+          guestBoot = true;
+        };
         # Field repro: the gateway on a machine WITHOUT /dev/kvm (VT-x off in
         # firmware). Pins the observed failure -- microvm@ crash-loops on the
         # qemu KVM error and login dead-ends in the viewer's socket error.

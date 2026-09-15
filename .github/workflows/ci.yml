@@ -52,8 +52,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       # Auto-discover like `just test`: new checks need no workflow edits.
+      #
+      # One exclusion, and only one. workstation-guest-boots needs the
+      # workstation microVM's guest to finish booting, and a GitHub-hosted
+      # runner is itself a VM: the test node is L2 and that guest is L3, where
+      # driver init traps so heavily the guest never gets there (one run: 834 s
+      # of uptime to register PF_PACKET, a core pegged, 6.8 GiB free — not a
+      # resource problem, a nesting-depth one). It boots in 84 s on a real
+      # host, so run it there: `just test-ws-guest`. Everything host-side is
+      # still covered here by workstation-starts, which shares the same file.
       - id: list
-        run: echo "checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "checks=$(nix eval --json .#checks.x86_64-linux --apply \
+            'cs: builtins.filter (n: n != "workstation-guest-boots") (builtins.attrNames cs)')" >> "$GITHUB_OUTPUT"
 
   test:
     name: "Test: ${{ matrix.check }}"

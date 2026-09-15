@@ -17,6 +17,22 @@
 # Needs nested KVM: the gateway runs under KVM and the workstation runs inside
 # it. Check with /sys/module/kvm_{intel,amd}/parameters/nested.
 #
+# TWO CHECKS COME OUT OF THIS FILE, because 4. needs a machine CI does not have:
+#
+#   workstation-starts       everything host-side, up to and including the
+#                            viewer staying attached. Minutes. Runs in CI.
+#   workstation-guest-boots  the same, plus `guestBoot` below: the guest
+#                            finishes booting and reaches graphical.target.
+#                            NOT run in CI -- see .github/workflows/ci.yml.
+#
+# The split is not squeamishness about a slow test. A GitHub-hosted runner is
+# itself a VM, so the node here is L2 and the workstation microVM is L3, and an
+# L3 guest traps its way through driver init: one CI run logged 622 s to reach
+# "EDAC MC", 834 s to register PF_PACKET, and never got further, while burning
+# a core -- with 6.8 GiB free and zero memory pressure, so this is virtualization
+# depth, not resources. The same guest on a real host (L2) reaches
+# graphical.target in 84 s. Run the guest check where the machine is real.
+#
 # Covered as far as it can be: the socket is created, accepts a connection, is
 # handed to the viewer user, and remote-viewer attaches and stays attached.
 #
@@ -27,9 +43,11 @@
 # exits at startup. The VM's GPU reports "-virgl" and the viewer shows a black
 # display no matter how correct the configuration is. Verify that on hardware.
 #
-# Run: `nix build .#checks.x86_64-linux.workstation-starts -L`.
+# Run: `nix build .#checks.x86_64-linux.workstation-starts -L`
+#      `nix build .#checks.x86_64-linux.workstation-guest-boots -L`  (or
+#      `just test-ws-guest`), on a host with nested KVM.
 ##############################################################################
-{ system, nixpkgs, microvm }:
+{ system, nixpkgs, microvm, guestBoot ? false }:
 
 let
   wsIp = "10.152.152.2";
@@ -46,7 +64,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "workstation-starts";
+  name = if guestBoot then "workstation-guest-boots" else "workstation-starts";
 
   # Read the screen. A live SPICE socket proves qemu is listening, not that
   # anything is drawn -- the desktop can be dead behind a working socket.
@@ -101,17 +119,18 @@ pkgs.testers.runNixOSTest {
     # is enough. What matters is that the tmpfiles rules own it correctly.
     #
     # Sized to fit the smallest machine this runs on, which is a GitHub-hosted
-    # runner: 4 vCPU / 16 GiB. The guest's RAM is host-anonymous memory two
-    # levels down (qemu backs it with a memfd inside this VM, which qemu backs
-    # again on the runner), so the runner has to physically hold essentially
-    # all of it while the guest's kernel first touches its address space.
-    # At the original 12 GiB here + 8 GiB inside, that plus the nix builder
-    # overcommitted a 16 GiB runner and the box swapped: CI showed the guest
-    # kernel spending 112 s between two adjacent early-boot lines (normally
-    # milliseconds apart) and never getting further -- every first touch of a
-    # guest page turning into a host page-in from disk. This budget (8 GiB
-    # here, 4 GiB inside) leaves the runner headroom and still exceeds what
-    # Plasma needs to reach a greeter. Keep the sum well under 16 GiB.
+    # runner: 4 vCPU / 16 GiB. The original 12 GiB here + 8 GiB inside asked
+    # that runner for more than it has, once the nix builder is counted too:
+    # the guest's RAM is host-anonymous memory two levels down (qemu backs it
+    # with a memfd inside this VM, which qemu backs again on the runner), so
+    # the runner has to hold it for real. 8 GiB here and 4 GiB inside leaves
+    # headroom and still exceeds what Plasma needs to reach a greeter -- a
+    # later run measured the guest touching 456 MiB of it, with 6.8 GiB free
+    # and no memory pressure at all. Keep the sum well under 16 GiB.
+    #
+    # Note what this does NOT fix: the guest still crawls on a CI runner,
+    # because it is an L3 guest there. That is why the guest-boot assertions
+    # live in a separate check; see the header.
     virtualisation.memorySize = 8192;
     virtualisation.cores = 4;
     virtualisation.diskSize = 16384;
@@ -321,9 +340,11 @@ pkgs.testers.runNixOSTest {
             f"spice-sock-perms fired {perms_starts} times: the socket keeps "
             "being recreated"
         )
+  '' + nixpkgs.lib.optionalString guestBoot ''
 
     # ---- the guest itself ---------------------------------------------------
-    # Everything above was the host's side of the microVM. The guest is
+    # Only in the workstation-guest-boots check; see the header. Everything
+    # above is the host's side of the microVM and runs everywhere. The guest is
     # reachable from here in exactly two ways: its serial console (qemu's
     # stdout, hence the unit's journal) and the isolated bridge. Both checks
     # below are judged by PROGRESS, not by a deadline: this guest is a VM
@@ -360,10 +381,12 @@ pkgs.testers.runNixOSTest {
         print(gateway.execute(
             "systemctl status --no-pager --full microvm@workstation"
         )[1])
-        # A guest that crawls instead of hanging is nearly always the machine
-        # underneath being out of memory: the guest's RAM is host memory two
-        # levels down, and once the box swaps, every first touch of a guest
-        # page becomes a page-in from disk. Show what memory looked like.
+        # Distinguishes the two ways a guest crawls rather than hangs. If the
+        # box is out of memory -- the guest's RAM is host memory two levels
+        # down, so once it swaps every first touch of a guest page is a
+        # page-in from disk -- this shows it. If memory is plentiful and the
+        # guest is still crawling, it is virtualization depth (an L3 guest
+        # traps its way through driver init), which no budget here can fix.
         print("=== memory on the gateway ===")
         print(gateway.execute("free -m; cat /proc/pressure/memory 2>/dev/null")[1])
         raise AssertionError(why)

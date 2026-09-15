@@ -108,6 +108,12 @@ test-leak:
 test-duress:
     nix build .#checks.x86_64-linux.duress-wipes-persist -L --show-trace
 
+# The workstation guest finishing its own boot (graphical.target). Excluded
+# from CI: a GitHub runner is a VM, so the guest is L3 there and crawls. Needs
+# a host whose KVM is its own -- then it is ~3 min.
+test-ws-guest:
+    nix build .#checks.x86_64-linux.workstation-guest-boots -L --show-trace
+
 # Workstation return-traffic regression: eval-level ruleset check (no KVM) plus
 # the end-to-end VM proof (needs KVM).
 test-ws-return:
