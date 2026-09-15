@@ -272,11 +272,47 @@ pkgs.testers.runNixOSTest {
         # pixels reach the viewer depends on GL, which needs a render node the
         # build sandbox does not have -- so assert the guest side started, and
         # leave the pixels to the hardware.
-        gateway.wait_until_succeeds(
-            "journalctl -u microvm@workstation -b --no-pager "
-            "| grep -q 'Reached target Graphical Interface'",
-            timeout=300,
-        )
+        #
+        # Judged by progress, not by a deadline. This guest is a VM inside a VM
+        # booting Plasma off a 9p-mounted store: ~90s on an idle host, several
+        # times that on a busy one (a flat timeout=300 here failed on a loaded
+        # machine and passed on the same derivation minutes later). Any fixed
+        # deadline is therefore either flaky or so long it hides a real hang.
+        # So: keep waiting while the guest's console keeps moving -- systemd
+        # reprints "A start job is running for ..." roughly once a second, so a
+        # guest that is merely slow is never silent -- and give up when it goes
+        # quiet, which is a wedge rather than slowness. The cap is a backstop.
+        def guest_console():
+            # qemu's stdout IS the guest's serial console (microvm.nix passes
+            # `-serial chardev:stdio`), so the host unit's journal is the only
+            # place the guest's own boot messages can be read.
+            return gateway.succeed(
+                "journalctl -u microvm@workstation -b --no-pager"
+            )
+
+        def give_up(why, console):
+            # Without this a failure here says only "timed out": the guest is
+            # invisible from the host and nothing explains where it stopped.
+            print(f"=== {why}; guest console, last 80 lines ===")
+            print("\n".join(console.splitlines()[-80:]))
+            print("=== microvm@workstation status ===")
+            print(gateway.execute(
+                "systemctl status --no-pager --full microvm@workstation"
+            )[1])
+            raise AssertionError(
+                f"{why}: the guest never reached graphical.target"
+            )
+
+        quiet, waited, console = 0, 0, guest_console()
+        while "Reached target Graphical Interface" not in console:
+            if quiet >= 300:
+                give_up("the guest console has been silent for 5 min", console)
+            if waited >= 1800:
+                give_up("the guest is still booting after 30 min", console)
+            gateway.sleep(10)
+            waited += 10
+            previous, console = console, guest_console()
+            quiet = 0 if console != previous else quiet + 10
         gateway.screenshot("03-viewer")
 
     with subtest("the guest booted and claimed its address on the bridge"):
