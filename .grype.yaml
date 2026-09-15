@@ -13,6 +13,44 @@
 #       name: somepkg
 #       version: 1.2.3
 ignore:
+  # ---- openssl 3.6.3: rated Low upstream, Critical by NVD --------------------
+  # Both are from OpenSSL's 2026-08-25 advisory and are fixed in 3.6.4. OpenSSL
+  # itself rates BOTH "Severity: Low"; the Critical scores that trip the gate
+  # (CVSS 9.8 / 9.1) are NVD's own, and neither reaches this system (per-CVE
+  # reasoning below). https://openssl-library.org/news/secadv/20260825.txt
+  #
+  # Why not just bump the pin: the pinned channel has no fix. nixos-26.05 still
+  # ships 3.6.3 with no backported patch (checked at channel rev c3eea5b,
+  # 2026-09-14); only nixos-unstable has 3.6.4. openssl is a transitive
+  # dependency of nearly the whole closure, so pulling it from unstable through
+  # an overlay would rebuild everything from source — not viable in CI.
+  # Both entries pin version 3.6.3 on purpose: they expire by themselves the
+  # moment the channel moves to a fixed openssl, which is the real fix.
+  # (triaged 2026-09-15)
+
+  # Not reachable: CMP (RFC 4210) response validation passes the peer's sender
+  # DN to ERR_raise_data() as a format string. Only a CMP *client* that pins a
+  # server certificate or sets an expected sender ever runs that code, and
+  # nothing here speaks CMP. Upstream states the consequence is a crash: "no
+  # controlled memory write, arbitrary-address read, or reliable path to remote
+  # code execution".
+  - vulnerability: CVE-2026-63073
+    package:
+      name: openssl
+      version: 3.6.3
+
+  # Not reachable: EVP_Cipher() skips AEAD tag verification for
+  # ChaCha20-Poly1305 and AES-OCB when it is handed an EMPTY ciphertext, so a
+  # caller of that one-shot API can accept a forged message. TLS cannot hit it
+  # — a ChaCha20-Poly1305 record always carries at least its 16-byte tag, so
+  # the length passed is never 0 — it needs an application calling EVP_Cipher()
+  # directly on a zero-length ciphertext. Even then the forgeable message is
+  # empty: no key compromise and no plaintext disclosure.
+  - vulnerability: CVE-2026-75803
+    package:
+      name: openssl
+      version: 3.6.3
+
   # False positive: fixed in spice 0.13.2 (2016); we ship 0.16.0. Grype's CPE
   # range is unbounded. Same mismatch OpenEmbedded explicitly ignores.
   # https://www.cvedetails.com/cve/CVE-2016-0749/  (triaged 2026-08-17)
