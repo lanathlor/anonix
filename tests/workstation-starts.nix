@@ -99,10 +99,48 @@ pkgs.testers.runNixOSTest {
 
     # On the real host /persist is a LUKS-backed mount; here a plain directory
     # is enough. What matters is that the tmpfiles rules own it correctly.
-    # The guest alone asks for 8 GiB (workstation-desktop.nix forces it).
-    virtualisation.memorySize = 12288;
+    #
+    # Sized to fit the smallest machine this runs on, which is a GitHub-hosted
+    # runner: 4 vCPU / 16 GiB. The guest's RAM is host-anonymous memory two
+    # levels down (qemu backs it with a memfd inside this VM, which qemu backs
+    # again on the runner), so the runner has to physically hold essentially
+    # all of it while the guest's kernel first touches its address space.
+    # At the original 12 GiB here + 8 GiB inside, that plus the nix builder
+    # overcommitted a 16 GiB runner and the box swapped: CI showed the guest
+    # kernel spending 112 s between two adjacent early-boot lines (normally
+    # milliseconds apart) and never getting further -- every first touch of a
+    # guest page turning into a host page-in from disk. This budget (8 GiB
+    # here, 4 GiB inside) leaves the runner headroom and still exceeds what
+    # Plasma needs to reach a greeter. Keep the sum well under 16 GiB.
+    virtualisation.memorySize = 8192;
     virtualisation.cores = 4;
     virtualisation.diskSize = 16384;
+
+    # Guest-side overrides, merged as an extra module into the workstation
+    # microVM's own NixOS evaluation (microvm.vms.<name>.config takes every
+    # definition as a module, so this adds to -- does not replace -- the one
+    # in modules/microvm-host.nix).
+    microvm.vms.workstation.config = {
+      # 4 GiB / 2 vCPU instead of the production 8 GiB / 4 vCPU that
+      # workstation-desktop.nix mkForces: see the memory budget above, and
+      # note this VM has 4 vCPUs total, so 4 for the guest oversubscribes
+      # them. mkOverride 40 to outrank that mkForce (50). 4096 is the base
+      # default from workstation.nix, and deliberately not 2048 -- qemu hangs
+      # on exactly 2 GiB (microvm.nix#171). What is under test is that the VM
+      # starts and boots, not the production RAM budget.
+      microvm.mem = lib.mkOverride 40 4096;
+      microvm.vcpu = lib.mkOverride 40 2;
+
+      # Make the guest's serial console actually say what it is doing. The
+      # production cmdline carries NixOS's default loglevel=4, so between the
+      # early-printk lines and systemd's first status message the console is
+      # SILENT -- and the boot check below judges the guest by whether its
+      # console is still moving, which that silence makes meaningless (a
+      # healthy guest looks identical to a wedged one, and CI read it as
+      # wedged). At 7 the kernel narrates the whole boot down the same serial
+      # port, so "silent" means stuck.
+      boot.consoleLogLevel = 7;
+    };
     # -cpu max: nested virtualisation for the guest inside this guest.
     # -device virtio-gpu: gives this VM a /dev/dri render node so the inner
     # qemu's virtio-gpu-gl/egl-headless has something to bind. 2D only, so
@@ -156,6 +194,23 @@ pkgs.testers.runNixOSTest {
         assert inv == gateway.succeed(
             "systemctl show -p InvocationID --value microvm@workstation.service"
         ).strip(), "microvm@workstation restarted: it is crash-looping"
+
+    with subtest("the inner qemu is actually accelerated by KVM"):
+        # microvm.nix asks for `-M microvm,accel=kvm:tcg` AND `-enable-kvm`.
+        # Today the latter wins, so a missing /dev/kvm is fatal (that is what
+        # tests/workstation-no-kvm.nix pins). If it ever stops winning, the
+        # fallback in that accel list means qemu boots the guest under TCG
+        # instead -- orders of magnitude slower, and completely silent about
+        # it. The guest would then "just be slow", which is exactly the
+        # failure this file's later checks cannot tell from a hang. Ask the
+        # kernel instead: an accelerated qemu holds /dev/kvm open.
+        pid = gateway.succeed(
+            "systemctl show -p MainPID --value microvm@workstation.service"
+        ).strip()
+        # No pipe into `grep -q` here: it exits on the first match, the writer
+        # gets SIGPIPE, and the driver runs commands under `pipefail`, so the
+        # check fails exactly when it succeeds. Ask find, and test its output.
+        gateway.succeed(f'test -n "$(find /proc/{pid}/fd -lname /dev/kvm)"')
 
     with subtest("qemu created the backing image"):
         gateway.wait_for_file("/persist/microvms/workstation/home.img")
@@ -267,64 +322,103 @@ pkgs.testers.runNixOSTest {
             "being recreated"
         )
 
+    # ---- the guest itself ---------------------------------------------------
+    # Everything above was the host's side of the microVM. The guest is
+    # reachable from here in exactly two ways: its serial console (qemu's
+    # stdout, hence the unit's journal) and the isolated bridge. Both checks
+    # below are judged by PROGRESS, not by a deadline: this guest is a VM
+    # inside a VM booting Plasma off a 9p-mounted store, ~90s on an idle host
+    # and several times that on a busy one (a flat timeout=300 failed on a
+    # loaded machine and passed on the same derivation minutes later), so any
+    # fixed deadline is either flaky or so long it hides a real hang. Keep
+    # waiting while the console keeps moving; give up when it goes quiet,
+    # which is a wedge rather than slowness. The caps are backstops.
+    #
+    # This only works because the guest's console is verbose: at the stock
+    # loglevel=4 a healthy guest is silent for minutes at a time and the whole
+    # heuristic is a coin flip. See boot.consoleLogLevel in the node above.
+    # systemd colourises the unit description in its status lines, so the
+    # guest's console carries "Reached target <ESC>[0;1;39mGraphical
+    # Interface<ESC>[0m." -- a plain `"Reached target Graphical Interface" in
+    # console` test does NOT match that, and only passes by way of the second,
+    # uncoloured copy the guest's journald pushes through kmsg. Do not depend
+    # on that copy: allow anything between the two halves.
+    import re
+    graphical = re.compile(r"Reached target[^\n]*Graphical Interface")
+
+    def guest_console():
+        return gateway.succeed(
+            "journalctl -u microvm@workstation -b --no-pager"
+        )
+
+    def give_up(why, console):
+        # Without this a failure here says only "timed out": the guest is
+        # invisible from the host and nothing explains where it stopped.
+        print(f"=== {why}; guest console, last 80 lines ===")
+        print("\n".join(console.splitlines()[-80:]))
+        print("=== microvm@workstation status ===")
+        print(gateway.execute(
+            "systemctl status --no-pager --full microvm@workstation"
+        )[1])
+        # A guest that crawls instead of hanging is nearly always the machine
+        # underneath being out of memory: the guest's RAM is host memory two
+        # levels down, and once the box swaps, every first touch of a guest
+        # page becomes a page-in from disk. Show what memory looked like.
+        print("=== memory on the gateway ===")
+        print(gateway.execute("free -m; cat /proc/pressure/memory 2>/dev/null")[1])
+        raise AssertionError(why)
+
+    def await_guest(done, why, cap=1800, quiet_budget=600):
+        quiet, waited, console = 0, 0, guest_console()
+        while not done():
+            if quiet >= quiet_budget:
+                give_up(
+                    f"{why}: its console has been silent for "
+                    f"{quiet_budget // 60} min, so it is wedged, not slow",
+                    console,
+                )
+            if waited >= cap:
+                give_up(
+                    f"{why}: still not there after {cap // 60} min, though its "
+                    "console is still moving",
+                    console,
+                )
+            gateway.sleep(10)
+            waited += 10
+            previous, console = console, guest_console()
+            quiet = 0 if console != previous else quiet + 10
+
+    with subtest("the guest booted and claimed its address on the bridge"):
+        # Checked before the desktop: it is the earliest guest-side milestone
+        # and needs no console output at all, so a failure here says "the guest
+        # never finished booting" while a failure below says "it booted but the
+        # desktop did not come up".
+        gateway.wait_for_unit("systemd-networkd.service")
+
+        # Not a ping: the killswitch drops the gateway's own ICMP to the
+        # workstation (KILLSWITCH-DROP-OUT on virbr-anon), by design. ARP sits
+        # below that filter, so a resolved neighbour entry is the liveness
+        # signal -- it means the guest booted and answered for ${wsIp}.
+        def on_the_bridge():
+            # `grep lladdr >/dev/null`, not `grep -q lladdr`: -q exits on the
+            # first match and SIGPIPEs the writer, which under the driver's
+            # `pipefail` shell turns a match into a failure.
+            return gateway.execute(
+                "ping -c1 -W1 ${wsIp} >/dev/null 2>&1 || true; "
+                "ip neigh show ${wsIp} | grep lladdr >/dev/null"
+            )[0] == 0
+
+        await_guest(on_the_bridge, "the guest never answered on the bridge")
+
     with subtest("the guest's own display manager came up"):
         # As close to "the desktop works" as this can get. Whether SDDM's
         # pixels reach the viewer depends on GL, which needs a render node the
         # build sandbox does not have -- so assert the guest side started, and
         # leave the pixels to the hardware.
-        #
-        # Judged by progress, not by a deadline. This guest is a VM inside a VM
-        # booting Plasma off a 9p-mounted store: ~90s on an idle host, several
-        # times that on a busy one (a flat timeout=300 here failed on a loaded
-        # machine and passed on the same derivation minutes later). Any fixed
-        # deadline is therefore either flaky or so long it hides a real hang.
-        # So: keep waiting while the guest's console keeps moving -- systemd
-        # reprints "A start job is running for ..." roughly once a second, so a
-        # guest that is merely slow is never silent -- and give up when it goes
-        # quiet, which is a wedge rather than slowness. The cap is a backstop.
-        def guest_console():
-            # qemu's stdout IS the guest's serial console (microvm.nix passes
-            # `-serial chardev:stdio`), so the host unit's journal is the only
-            # place the guest's own boot messages can be read.
-            return gateway.succeed(
-                "journalctl -u microvm@workstation -b --no-pager"
-            )
-
-        def give_up(why, console):
-            # Without this a failure here says only "timed out": the guest is
-            # invisible from the host and nothing explains where it stopped.
-            print(f"=== {why}; guest console, last 80 lines ===")
-            print("\n".join(console.splitlines()[-80:]))
-            print("=== microvm@workstation status ===")
-            print(gateway.execute(
-                "systemctl status --no-pager --full microvm@workstation"
-            )[1])
-            raise AssertionError(
-                f"{why}: the guest never reached graphical.target"
-            )
-
-        quiet, waited, console = 0, 0, guest_console()
-        while "Reached target Graphical Interface" not in console:
-            if quiet >= 300:
-                give_up("the guest console has been silent for 5 min", console)
-            if waited >= 1800:
-                give_up("the guest is still booting after 30 min", console)
-            gateway.sleep(10)
-            waited += 10
-            previous, console = console, guest_console()
-            quiet = 0 if console != previous else quiet + 10
-        gateway.screenshot("03-viewer")
-
-    with subtest("the guest booted and claimed its address on the bridge"):
-        gateway.wait_for_unit("systemd-networkd.service")
-        # Not a ping: the killswitch drops the gateway's own ICMP to the
-        # workstation (KILLSWITCH-DROP-OUT on virbr-anon), by design. ARP sits
-        # below that filter, so a resolved neighbour entry is the liveness
-        # signal -- it means the guest booted and answered for ${wsIp}.
-        gateway.wait_until_succeeds(
-            "ping -c1 -W1 ${wsIp} >/dev/null 2>&1 || true; "
-            "ip neigh show ${wsIp} | grep -q lladdr",
-            timeout=240,
+        await_guest(
+            lambda: graphical.search(guest_console()) is not None,
+            "the guest never reached graphical.target",
         )
+        gateway.screenshot("03-viewer")
   '';
 }
